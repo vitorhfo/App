@@ -1,0 +1,3 @@
+React 18.3.1
+ReactDOM 18.3.1
+Official production UMD bundles; MIT licenses are included beside the bundles.

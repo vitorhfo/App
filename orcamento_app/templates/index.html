@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Orça · Orçamento técnico</title>
+  <link rel="stylesheet" href="/static/css/style.css?v=20261021-quote-views">
+  <link rel="stylesheet" href="/static/react/dashboard.css?v=20261027-react-1">
+</head>
+<body>
+
+  <div id="react-app-root" hidden></div>
+  <div id="react-sidebar-root"></div>
+
+  <!-- Main Content -->
+  <main class="content-area">
+    <div id="react-topbar-root"></div>
+
+    <div class="content-body">
+
+      <!-- ================= 1. PROJETOS ================= -->
+      <section id="view-projetos" class="view-panel active">
+        <div id="react-projects-root"></div>
+      </section>
+
+      <!-- ================= 2. IMPORTAÇÃO ================= -->
+      <section id="view-importacao" class="view-panel">
+        <div class="card">
+          <div class="card-header">
+            <h3>📥 Importar Desenhos & Pasta do Projeto</h3>
+          </div>
+          <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 16px;">
+            Escolha uma pasta inteira, um PDF avulso ou um arquivo ZIP/RAR. As subpastas e os nomes dos PDFs são preservados para montar a estrutura do produto.
+          </p>
+
+          <div class="grid-2">
+            <div>
+              <div class="form-group">
+                <label>Selecionar pasta inteira:</label>
+                <input type="file" id="import-folder-files" class="form-control" webkitdirectory directory multiple>
+                <small style="color: var(--text-muted); font-size: 0.75rem; display: block; margin-top: 4px;">Envia os PDFs da pasta e das subpastas.</small>
+              </div>
+              <button class="btn btn-primary" onclick="uploadSelectedPdfs('import-folder-files', true)">📁 Importar pasta</button>
+            </div>
+            <div>
+              <div class="form-group">
+                <label>Selecionar um PDF:</label>
+                <input type="file" id="import-pdf-input" class="form-control" accept=".pdf,application/pdf">
+                <small style="color: var(--text-muted); font-size: 0.75rem; display: block; margin-top: 4px;">Se não houver lista de peças, o desenho entra como corpo principal pendente.</small>
+              </div>
+              <button class="btn btn-secondary" onclick="uploadSelectedPdfs('import-pdf-input', false)">📄 Importar PDF</button>
+            </div>
+          </div>
+          <div class="grid-2" style="margin-top:18px;">
+            <div>
+              <div class="form-group">
+                <label>Ou informar caminho de uma pasta já neste computador:</label>
+                <input type="text" id="import-folder-input" class="form-control" list="jose-source-folders" placeholder="Ex: C:\Users\Luis\Desktop\app\DADOS\ILHA CASH RECKITT">
+              </div>
+              <button class="btn btn-secondary" onclick="importFromFolder()">🔍 Ler pasta pelo caminho</button>
+            </div>
+            <div>
+              <div class="form-group">
+                <label>Ou selecionar arquivo ZIP/RAR:</label>
+                <input type="file" id="import-archive-input" class="form-control" accept=".zip,.rar,application/zip,application/vnd.rar">
+              </div>
+              <button class="btn btn-secondary" onclick="uploadArchive()">📦 Importar ZIP/RAR</button>
+            </div>
+          </div>
+
+          <div id="import-log-box" style="margin-top: 20px; display: none;">
+            <div class="alert alert-info">
+              <span id="import-log-text">Processando leitura de desenhos técnicos...</span>
+            </div>
+          </div>
+          <div style="margin-top:20px;">
+            <h3>Estrutura do produto extraída</h3>
+            <p style="font-size:0.8rem;color:var(--text-muted);">Abra os conjuntos para conferir quantidades e desenhos de origem. A lista consolidada está na próxima tela.</p>
+            <div id="assembly-tree" class="assembly-tree">Selecione um projeto para ver os conjuntos.</div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 3. BOM (LISTA DE MATERIAIS) ================= -->
+      <section id="view-bom" class="view-panel">
+        <div class="card-header" style="border: none; padding: 0; margin-bottom: 16px;">
+          <div>
+            <h2>Lista de Materiais (BOM)</h2>
+            <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 2px;">
+              Peças físicas do orçamento, com quantidades já multiplicadas pelos conjuntos. Edite os subconjuntos na estrutura do produto para atualizar suas peças.
+            </p>
+          </div>
+          <div style="display: flex; gap: 8px;">
+            <button class="btn btn-secondary btn-sm" onclick="switchView('view-importacao')">Ver estrutura e quantidades</button>
+            <input id="bom-filter-search" class="form-control bom-search" type="search" placeholder="Buscar peça, desenho ou material" aria-label="Buscar peça" oninput="renderMaterialsTable()">
+            <select id="bom-filter-type" class="form-control" style="width: 175px;" onchange="renderMaterialsTable()">
+              <option value="ALL">Todos os tipos</option>
+              <option value="materia_prima">Matéria-prima</option>
+              <option value="comprado">Item comprado</option>
+            </select>
+            <select id="bom-filter-group" class="form-control" style="width: 200px;" onchange="renderMaterialsTable()">
+              <option value="ALL">Todos os Grupos</option>
+              <option value="Chapa">Chapas</option>
+              <option value="Arame">Arames</option>
+              <option value="Tubo Quadrado/Retangular">Tubos Retang./Quad.</option>
+              <option value="Tubo Redondo">Tubos Redondos</option>
+              <option value="Polímero/PSAI">Polímeros / PSAI</option>
+              <option value="Ferragens">Ferragens</option>
+              <option value="Pintura a Pó">Pintura a Pó</option>
+              <option value="Embalagem">Embalagem</option>
+              <option value="Outros Comprados">Outros comprados</option>
+            </select>
+            <button class="btn btn-secondary btn-sm" onclick="openNewMaterialModal()">+ Adicionar Item</button>
+          </div>
+        </div>
+
+        <div class="ai-import-bar">
+          <button class="btn btn-primary btn-sm ai-import-pending-button" onclick="importAiPendingDimensions()" disabled>Importar cotas e peças encontradas pela IA</button>
+          <small class="ai-import-pending-status">Selecione um projeto para conferir as cotas encontradas.</small>
+        </div>
+
+        <details id="project-pdfs-panel" class="pdf-inventory">
+          <summary>PDFs do projeto (<span id="project-pdfs-count">0</span>) <small id="project-pdfs-warning"></small></summary>
+          <div class="pdf-inventory-body">
+            <p>Todos os desenhos importados aparecem aqui, inclusive os que ficaram sem cotas ou sem item vinculado. A conferência com IA percorre as páginas automaticamente e compara os resultados com o script. O botão acima reaplica as cotas pendentes encontradas nas revisões já salvas.</p>
+            <p class="ai-review-notice">Ao importar um projeto, todas as páginas dos PDFs entram automaticamente na fila com Gemini 3.5 Flash-Lite. Se a cota diária acabar, as páginas restantes passam ao 3.1 Flash-Lite. Um limite por minuto apenas aguarda. Cotas ausentes, vinculadas com segurança à peça e sustentadas pela folha, são preenchidas e recalculadas automaticamente; medidas existentes e edições manuais são preservadas. Para desenhos difíceis, você pode selecionar o 3.8 Flash e reanalisar o PDF. Cotas ambíguas continuam identificadas para conferência.</p>
+            <input id="project-pdfs-filter" class="form-control" type="search" placeholder="Buscar desenho PDF" oninput="renderProjectPdfs()" aria-label="Buscar desenho PDF">
+            <div id="project-pdfs-list">Selecione um projeto para ver os PDFs.</div>
+          </div>
+        </details>
+
+        <div class="table-responsive">
+          <table class="data-table" id="bom-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>Qtd</th>
+                <th>Descrição do Item</th>
+                <th>Tipo</th>
+                <th>Grupo</th>
+                <th>Material</th>
+                <th>Dimensões (mm)</th>
+                <th>Peso Unit (kg)</th>
+                <th>Peso Tot (kg)</th>
+                <th>Área Tot (m²)</th>
+                <th>Impressão</th>
+                <th>Preço Unit (R$)</th>
+                <th>Preço Tot (R$)</th>
+                <th>Fonte Preço</th>
+                <th>Origem</th>
+                <th>Confiança</th>
+                <th>Ações</th>
+              </tr>
+            </thead>
+            <tbody id="bom-tbody">
+              <tr><td colspan="17" style="text-align: center; padding: 25px;">Nenhum projeto carregado.</td></tr>
+            </tbody>
+            <tfoot id="bom-tfoot">
+            </tfoot>
+          </table>
+        </div>
+        <div id="wire-variants-panel" class="card" style="display:none;margin-top:16px;">
+          <h3>Variantes de arame do desenho</h3>
+          <p>A medida A identifica o tamanho da peça dobrada. O orçamento usa o comprimento da coluna COMPRIMENTO; a quantidade fica pendente até você informar qual código entra no projeto.</p>
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead><tr><th>Código</th><th>Nominal</th><th>Medida A</th><th>Comprimento de corte</th><th>Material</th><th>Conferência IA</th><th>Quantidade</th><th>Origem</th></tr></thead>
+              <tbody id="wire-variants-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div id="ai-discovered-panel" class="card" style="display:none;margin-top:16px;">
+          <h3>Peças encontradas apenas pela IA</h3>
+          <p>As cotas e a fonte foram guardadas. Informe a quantidade total do projeto para incluir uma peça com corte completo no orçamento. Itens incompletos permanecem para conferência.</p>
+          <div class="table-responsive">
+            <table class="data-table">
+              <thead><tr><th>Peça</th><th>Material</th><th>Cotas (mm)</th><th>Evidência</th><th>Quantidade total</th><th>Origem</th></tr></thead>
+              <tbody id="ai-discovered-tbody"></tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 4. CONFERÊNCIA DE PESO ================= -->
+      <section id="view-peso" class="view-panel">
+        <div class="alert alert-warning" style="margin-bottom: 20px;">
+          <span>⚖️ <b>Diretriz de Rigor:</b> O peso da <b>Estrutura Metálica em Aço</b> (chapas, tubos, arames) nunca deve ser confundido com o peso do <b>Produto Completo Montado</b> (que inclui polímeros, PSAI, acrílico, rodízios, ferragens e embalagem).</span>
+        </div>
+
+        <div class="grid-4" style="margin-bottom: 20px;">
+          <div class="metric-card">
+            <div class="metric-title">Peso Estrutura em Aço</div>
+            <div class="metric-value" id="weight-steel-val">0.000 kg</div>
+            <div class="metric-sub" id="weight-steel-hist">Histórico: -</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-title">Peso Produto Completo</div>
+            <div class="metric-value" id="weight-total-val">0.000 kg</div>
+            <div class="metric-sub" id="weight-pdf-ref">Carimbo PDF: -</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-title">Divergência Nominal</div>
+            <div class="metric-value" id="weight-delta-val">0.00%</div>
+            <div class="metric-sub" id="weight-delta-status">Status: OK</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-title">Preço / kg Estrutura Aço</div>
+            <div class="metric-value" id="weight-price-kg">R$ 0.00 / kg</div>
+            <div class="metric-sub">Base preço sugerido total</div>
+          </div>
+        </div>
+        <div id="weight-audit-note" class="alert alert-warning" style="margin-bottom:20px;"></div>
+
+        <div class="grid-2">
+          <div class="card">
+            <div class="card-header">
+              <h3>Distribuição de Peso por Grupo</h3>
+            </div>
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Grupo de Material</th>
+                  <th>Peso Calculado (kg)</th>
+                  <th>Participação (%)</th>
+                </tr>
+              </thead>
+              <tbody id="weight-groups-tbody">
+              </tbody>
+            </table>
+          </div>
+
+          <div class="card">
+            <div class="card-header">
+              <h3>Peças de Maior Peso (Explicação do Peso)</h3>
+            </div>
+            <table class="data-table">
+              <thead>
+                <tr>
+                  <th>Componente</th>
+                  <th>Qtd</th>
+                  <th>Peso Tot (kg)</th>
+                  <th>Desenho ID</th>
+                </tr>
+              </thead>
+              <tbody id="weight-top-tbody">
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 5. CUSTOS E MARKUP ================= -->
+      <section id="view-custos" class="view-panel">
+        <div class="grid-3" style="margin-bottom: 20px;">
+          <div class="metric-card">
+            <div class="metric-title">Preço de Venda Sugerido</div>
+            <div class="metric-value" id="mk-preco-sugerido" style="color: var(--primary);">R$ 0,00</div>
+            <div class="metric-sub">Consolidação MP + Comprados</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-title">Custo Direto Total</div>
+            <div class="metric-value" id="mk-custo-total">R$ 0,00</div>
+            <div class="metric-sub" id="mk-custo-split">MP: R$ 0 | Comprado: R$ 0</div>
+          </div>
+          <div class="metric-card">
+            <div class="metric-title">Margem Ponderada</div>
+            <div class="metric-value" id="mk-margem-pond">0.00%</div>
+            <div class="metric-sub">Preço por kg: R$ 0,00/kg</div>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <!-- Coluna Matéria-Prima -->
+          <div class="card">
+            <div class="card-header">
+              <h3>1. Matéria-Prima (com Rateio de Produção M.O.)</h3>
+              <span class="badge badge-info" id="badge-fator-mp">Fator MK: 3.86x</span>
+            </div>
+            <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 12px;">
+              Custo MP: <b id="lbl-custo-mp">R$ 0,00</b> &nbsp;|&nbsp; Preço MP: <b id="lbl-preco-mp" style="color: var(--primary);">R$ 0,00</b>
+            </p>
+
+            <h4 style="font-size: 0.85rem; margin-bottom: 8px;">Rateio de Produção / Mão de Obra (20 Postos):</h4>
+            <div style="max-height: 240px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 14px;">
+              <table class="data-table" style="font-size: 0.78rem;">
+                <thead>
+                  <tr>
+                    <th>Ativo</th>
+                    <th>Centro de Custo</th>
+                    <th>Efetivo (%)</th>
+                    <th>Valor (R$)</th>
+                  </tr>
+                </thead>
+                <tbody id="mk-mo-tbody">
+                </tbody>
+              </table>
+            </div>
+
+            <div class="form-group">
+              <label>Margem de Lucro Matéria-Prima (%):</label>
+              <input type="number" id="mk-margin-mp-input" class="form-control" value="18.0" step="0.5">
+            </div>
+          </div>
+
+          <!-- Coluna Material Comprado -->
+          <div class="card">
+            <div class="card-header">
+              <h3>2. Material Comprado (SEM Rateio M.O.)</h3>
+              <span class="badge badge-info" id="badge-fator-mc">Fator MK: 2.58x</span>
+            </div>
+            <p style="font-size: 0.8rem; color: var(--text-muted); margin-bottom: 12px;">
+              Custo Comprado: <b id="lbl-custo-mc">R$ 0,00</b> &nbsp;|&nbsp; Preço Comprado: <b id="lbl-preco-mc" style="color: var(--primary);">R$ 0,00</b>
+            </p>
+
+            <h4 style="font-size: 0.85rem; margin-bottom: 8px;">Despesas Operacionais & Impostos Aplicáveis:</h4>
+            <div style="max-height: 240px; overflow-y: auto; border: 1px solid var(--border); border-radius: var(--radius); margin-bottom: 14px;">
+              <table class="data-table" style="font-size: 0.78rem;">
+                <thead>
+                  <tr>
+                    <th>Ativo</th>
+                    <th>Componente</th>
+                    <th>Alíquota (%)</th>
+                    <th>Valor Comprado (R$)</th>
+                  </tr>
+                </thead>
+                <tbody id="mk-op-tax-tbody">
+                </tbody>
+              </table>
+            </div>
+
+            <div class="form-group">
+              <label>Margem de Lucro Material Comprado (%):</label>
+              <input type="number" id="mk-margin-mc-input" class="form-control" value="18.0" step="0.5">
+            </div>
+          </div>
+        </div>
+
+        <div style="text-align: right; margin-top: 10px;">
+          <button class="btn btn-primary" onclick="saveMarkupConfig()">💾 Salvar e Recalcular Preço de Venda</button>
+          <button class="btn btn-success" onclick="approveMarkupConfig()">✓ Aprovar taxas deste projeto</button>
+        </div>
+      </section>
+
+      <!-- ================= 6. PENDÊNCIAS ================= -->
+      <section id="view-pendencias" class="view-panel">
+        <div class="card-header" style="border: none; padding: 0; margin-bottom: 16px;">
+          <div>
+            <h2>Pendências & Decisões Técnicas</h2>
+            <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 2px;">
+              Itens inferidos, sem preço na tabela ou sem cota explícita no PDF. A versão FINAL do orçamento só pode ser emitida após aprovação das pendências.
+            </p>
+          </div>
+        </div>
+
+        <div class="ai-import-bar">
+          <button class="btn btn-primary btn-sm ai-import-pending-button" onclick="importAiPendingDimensions()" disabled>Importar cotas e peças encontradas pela IA</button>
+          <small class="ai-import-pending-status">Selecione um projeto para conferir as cotas encontradas.</small>
+        </div>
+
+        <div class="table-responsive">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Item / Componente</th>
+                <th>Descrição da Incerteza</th>
+                <th>Impacto</th>
+                <th>Ação Proposta</th>
+                <th>Status</th>
+                <th>Decisão</th>
+              </tr>
+            </thead>
+            <tbody id="pendencias-tbody">
+              <tr><td colspan="6" style="text-align: center; padding: 25px;">Nenhuma pendência cadastrada para o projeto.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+
+      <!-- ================= 7–9. TRÊS VISÕES DO ORÇAMENTO ================= -->
+      <section id="view-orc-script" class="view-panel">
+        <div class="card">
+          <div class="card-header"><div><h3>Orçamento do script</h3>
+            <p>Peças e custos lidos pelo aplicativo. Campos posteriormente importados da IA aparecem com o valor anterior à importação; ajustes manuais posteriores são preservados.</p>
+          </div></div>
+          <div id="quote-script-summary" class="quote-view-summary"></div>
+          <div id="quote-script-table" class="table-responsive"></div>
+        </div>
+      </section>
+
+      <section id="view-orc-ia" class="view-panel">
+        <div class="card">
+          <div class="card-header"><div><h3>Orçamento lido pela IA</h3>
+            <p>Leituras dos PDFs concluídos, com página, modelo e escopo da quantidade. Variantes sem quantidade total e itens sem tarifa validada não entram em custo.</p>
+          </div></div>
+          <div id="quote-ai-summary" class="quote-view-summary"></div>
+          <div id="quote-ai-table" class="table-responsive"></div>
+        </div>
+      </section>
+
+      <section id="view-orc-acordo" class="view-panel">
+        <div class="card">
+          <div class="card-header"><div><h3>Informações conferidas pelo script e pela IA</h3>
+            <p>Cada cota exibida concorda com uma leitura independente. O custo conhecido entra no subtotal apenas quando todas as cotas necessárias e a quantidade total conferem; preços seguem as regras aprovadas do aplicativo.</p>
+          </div></div>
+          <div id="quote-agreement-summary" class="quote-view-summary"></div>
+          <div id="quote-agreement-table" class="table-responsive"></div>
+        </div>
+      </section>
+
+      <!-- ================= 10. ORÇAMENTO FINAL ================= -->
+      <section id="view-final" class="view-panel">
+        <div class="card">
+          <div class="card-header">
+            <div>
+              <h3>Planilhas do orçamento</h3>
+              <p style="font-size: 0.8rem; color: var(--text-muted);">Revise itens, pesos e preços. O FATOR MARKUP é preenchido por você separadamente.</p>
+            </div>
+            <div style="display: flex; gap: 10px; flex-wrap: wrap;">
+              <button class="btn btn-primary" onclick="exportCurrent('modelos/planilhas')">📦 Baixar CÁLCULO + CUSTO</button>
+              <button class="btn btn-secondary" onclick="exportCurrent('modelos/calculo')">CÁLCULO — aba Total</button>
+              <button class="btn btn-secondary" onclick="exportCurrent('modelos/custos')">PLANILHA DE CUSTO</button>
+            </div>
+          </div>
+
+          <div id="final-summary-view" style="padding: 10px 0;">
+            <!-- Preenchido via Javascript -->
+          </div>
+          <div class="card" style="margin-top: 14px;">
+            <h3>Versões do orçamento</h3>
+            <p id="final-gate-message"></p>
+            <div class="grid-2">
+              <div class="form-group"><label>Preço final definido por você (R$; opcional)</label><input id="final-price-input" class="form-control" type="number" min="0.01" step="0.01"></div>
+              <div><button class="btn btn-secondary" onclick="saveBudgetVersion(false)">Guardar preliminar</button>
+              <button class="btn btn-success" onclick="saveBudgetVersion(true)">Emitir versão final</button></div>
+            </div>
+            <div id="versions-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= 8. REGRAS E PREÇOS VIGENTES ================= -->
+      <section id="view-regras" class="view-panel">
+        <div class="card-header" style="border: none; padding: 0; margin-bottom: 16px;">
+          <div>
+            <h2>Preços e regras para aprovação</h2>
+            <p style="font-size: 0.85rem; color: var(--text-muted); margin-top: 2px;">
+              Referências candidatas e regras aprovadas, com fonte, unidade e data.
+            </p>
+          </div>
+        </div>
+
+        <div class="table-responsive">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Chave da Regra</th>
+                <th>Descrição</th>
+                <th>Categoria</th>
+                <th>Valor</th>
+                <th>Unidade</th>
+                <th>Data Vigência</th>
+                <th>Fonte / Documentação</th>
+                <th>Situação</th>
+                <th>Ações</th>
+              </tr>
+            </thead>
+            <tbody id="rules-tbody">
+              <tr><td colspan="9" style="text-align: center; padding: 20px;">Carregando regras...</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card" style="margin-top:16px;">
+          <h3>Tabela histórica de itens comprados</h3>
+          <p>Valores de 05/2025 entram como candidatos. Aprovar somente após conferir vigência e unidade.</p>
+          <input id="catalog-query" class="form-control" placeholder="Buscar tubo, parafuso, arame...">
+          <button class="btn btn-secondary" onclick="searchCatalog()">Buscar</button>
+          <div id="catalog-results"></div>
+        </div>
+      </section>
+
+    </div>
+  </main>
+
+  <!-- MODAL: Novo Projeto -->
+  <div id="modal-new-project" class="modal-overlay">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3>Criar Novo Projeto de Orçamento</h3>
+        <button class="btn btn-sm btn-secondary" onclick="closeModal('modal-new-project')">✕</button>
+      </div>
+      <div class="form-group">
+        <label>Nome do Projeto:</label>
+        <input type="text" id="np-name" class="form-control" placeholder="Ex: ILHA CASH ATACADÃO - RECKITT">
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label>Código do Projeto:</label>
+          <input type="text" id="np-code" class="form-control" placeholder="Ex: 150056">
+        </div>
+        <div class="form-group">
+          <label>Cliente:</label>
+          <input type="text" id="np-client" class="form-control" value="HH GLOBAL">
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Caminho da Pasta de Arquivos (opcional):</label>
+        <select id="np-jose-folder" class="form-control" onchange="chooseJoseFolder(this.value)">
+          <option value="">Selecionar projeto da pasta José Vitor</option>
+        </select>
+        <input type="text" id="np-folder" class="form-control" list="jose-source-folders" placeholder="Ex: C:\Users\Luis\Desktop\app\DADOS\ILHA CASH RECKITT" style="margin-top: 8px;">
+      </div>
+      <div class="form-group">
+        <label>Observações:</label>
+        <textarea id="np-notes" class="form-control" rows="2"></textarea>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('modal-new-project')">Cancelar</button>
+        <button class="btn btn-primary" onclick="submitNewProject()">Criar Projeto</button>
+      </div>
+    </div>
+  </div>
+  <datalist id="jose-source-folders"></datalist>
+
+  <!-- MODAL: Editar Material BOM -->
+  <div id="modal-edit-material" class="modal-overlay">
+    <div class="modal-content">
+      <div class="modal-header">
+        <h3 id="em-title">Editar Componente / Material</h3>
+        <button class="btn btn-sm btn-secondary" onclick="closeModal('modal-edit-material')">✕</button>
+      </div>
+      <input type="hidden" id="em-id">
+      <div class="form-group">
+        <label>Descrição:</label>
+        <input type="text" id="em-desc" class="form-control">
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label>Tipo de item:</label>
+          <select id="em-type" class="form-control">
+            <option value="materia_prima">Matéria-prima</option>
+            <option value="comprado">Item comprado</option>
+            <option value="subconjunto">Subconjunto (estrutura)</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Conjunto pai (separar níveis por /):</label>
+          <input type="text" id="em-parent" class="form-control" placeholder="Corpo principal / Subconjunto">
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label>Grupo:</label>
+          <select id="em-group" class="form-control">
+            <option value="Chapa">Chapa</option>
+            <option value="Arame">Arame</option>
+            <option value="Tubo Quadrado/Retangular">Tubo Quadrado/Retangular</option>
+            <option value="Tubo Redondo">Tubo Redondo</option>
+            <option value="Polímero/PSAI">Polímero / PSAI</option>
+            <option value="Ferragens">Ferragens</option>
+            <option value="Acessórios/Outros Comprados">Acessórios / Comprados</option>
+            <option value="Pintura a Pó">Pintura a Pó</option>
+            <option value="Embalagem">Embalagem</option>
+            <option value="Outros Comprados">Outros Comprados</option>
+            <option value="Subconjunto">Subconjunto</option>
+          </select>
+        </div>
+        <div class="form-group">
+          <label>Material:</label>
+          <input type="text" id="em-material" class="form-control">
+        </div>
+      </div>
+      <div class="grid-3">
+        <div class="form-group">
+          <label>Quantidade:</label>
+          <input type="number" id="em-qty" class="form-control" step="0.1">
+        </div>
+        <div class="form-group">
+          <label id="em-len-label">Comprimento (mm):</label>
+          <input type="number" id="em-len" class="form-control" step="any">
+        </div>
+        <div class="form-group">
+          <label>Largura (mm):</label>
+          <input type="number" id="em-width" class="form-control" step="any">
+        </div>
+      </div>
+      <div class="grid-3">
+        <div class="form-group">
+          <label>Espessura (mm):</label>
+          <input type="number" id="em-thk" class="form-control" step="any">
+        </div>
+        <div class="form-group">
+          <label>Profundidade / altura do tubo (mm):</label>
+          <input type="number" id="em-depth" class="form-control" step="any">
+        </div>
+        <div class="form-group">
+          <label>Ø / Diâmetro (mm):</label>
+          <input type="number" id="em-diam" class="form-control" step="any">
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label>Unidade:</label>
+          <select id="em-unit" class="form-control"><option value="?">Pendente</option><option value="un">un</option><option value="kg">kg</option><option value="m">m</option><option value="m2">m²</option></select>
+        </div>
+        <div class="form-group">
+          <label>Impressão:</label>
+          <select id="em-print" class="form-control">
+            <option value="0x0">0x0 (Sem Impressão)</option>
+            <option value="4x0">4x0 (1 Face Colorida)</option>
+            <option value="4x1">4x1 (+10% Adicional)</option>
+            <option value="4x4">4x4 (2 Faces)</option>
+          </select>
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label>Peso Unitário (kg):</label>
+          <input type="number" id="em-weight" class="form-control" step="any">
+        </div>
+        <div class="form-group">
+          <label>Preço Unitário (R$):</label>
+          <input type="number" id="em-price" class="form-control" step="0.01">
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Observação Técnica:</label>
+        <input type="text" id="em-obs" class="form-control">
+      </div>
+      <div class="form-group">
+        <label>Questão de extração a revisar (apague após confirmar no desenho):</label>
+        <textarea id="em-pending" class="form-control" rows="2"></textarea>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-secondary" onclick="closeModal('modal-edit-material')">Cancelar</button>
+        <button id="save-material-button" class="btn btn-primary" onclick="submitEditMaterial()">Salvar e Recalcular</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/static/js/main.js?v=20261030-manual-save-pdf-page"></script>
+  <script src="/static/js/quote_views.js?v=20261021-quote-views"></script>
+  <script src="/static/react/vendor/react.production.min.js?v=18.3.1"></script>
+  <script src="/static/react/vendor/react-dom.production.min.js?v=18.3.1"></script>
+  <script type="module" src="/static/react/dashboard.js?v=20261027-react-1"></script>
+</body>
+</html>
