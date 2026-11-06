@@ -190,6 +190,7 @@ async function loadProjectDetails(id) {
     }
 
     renderMaterialsTable();
+    renderReadingReport();
     renderWireVariants();
     renderAiDiscoveredItems();
     renderAssemblyTree();
@@ -205,6 +206,34 @@ async function loadProjectDetails(id) {
   } catch (err) {
     console.error("Erro ao carregar detalhes:", err);
   }
+}
+
+function renderReadingReport() {
+  const target = document.getElementById('reading-report-content');
+  if (!target) return;
+  target.replaceChildren();
+  const report = currentProjectData?.reading_report;
+  if (!report?.events?.length) {
+    target.textContent = 'Este projeto ainda não tem registro de leitura. O registro será criado na próxima importação.';
+    return;
+  }
+  const notice = document.createElement('p');
+  notice.textContent = 'Registro da última importação. As medidas e quantidades pendentes ainda precisam de conferência nos desenhos. Edições posteriores aparecem na lista de materiais.';
+  target.appendChild(notice);
+  const stages = {selected: 'Lista usada como principal', recognized: 'Lista reconhecida',
+                  error: 'Falha de leitura', unresolved: 'Composição pendente'};
+  const list = document.createElement('ul');
+  for (const event of report.events) {
+    const item = document.createElement('li');
+    const heading = document.createElement('strong');
+    heading.textContent = `${stages[event.stage] || 'Leitura'}: ${event.label}`;
+    item.appendChild(heading);
+    const detail = document.createElement('p');
+    detail.textContent = `${event.source_page} · ${event.rows} linha(s). ${event.reason || ''}`;
+    item.appendChild(detail);
+    list.appendChild(item);
+  }
+  target.appendChild(list);
 }
 
 async function loadProjectPdfs(projectId) {

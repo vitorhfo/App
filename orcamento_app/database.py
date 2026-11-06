@@ -107,6 +107,8 @@ def init_db():
     )
     """)
     cur.execute("CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+    from reading_reports import ensure_reading_reports
+    ensure_reading_reports(conn)
 
     cur.execute("""
     CREATE TABLE IF NOT EXISTS ai_review_jobs (

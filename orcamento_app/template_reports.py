@@ -157,6 +157,16 @@ def _cost_material_identity(item: dict, section: str):
         # the wire family and diameter. Ignore BOM/catalog IDs in the key.
         stock = _normal_text(_clean_stock_material(item.get("material") or ""))
         stock = re.sub(r"\s+ARTEFATO\s*[Ø⌀].*$", "", stock)
+        # Some component lists encode both stock and cut in DESCRIÇÃO. The
+        # cut stays in CÁLCULO; a bare "ARAME Ø6 x 200" and "... x 400"
+        # share one procurement stock. Keep explicit grades (BTC/INOX/etc.)
+        # distinct instead of removing arbitrary material qualifiers.
+        cut_stock = re.fullmatch(
+            r"(ARAME\s*[Ø⌀]\s*\d+(?:[,.]\d+)?)\s*[X×]\s*\d+(?:[,.]\d+)?\s*(?:MM)?",
+            stock,
+        )
+        if cut_stock:
+            stock = cut_stock.group(1)
         if stock:
             material = stock
         spec = (item.get("radius_diam"),)

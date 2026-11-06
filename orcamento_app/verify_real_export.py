@@ -1,6 +1,7 @@
 """Inspect a filled company-template export against its source templates and app totals."""
 
 import json
+import math
 from pathlib import Path
 import sys
 
@@ -9,6 +10,15 @@ import xlrd
 
 from app import get_project_full_data
 from template_reports import CALC_TEMPLATE
+
+
+def same_template_cell(before, after):
+    """Allow only floating-point recalc noise, preserving text and cell types."""
+    if before.ctype != after.ctype:
+        return False
+    if before.ctype == xlrd.XL_CELL_NUMBER:
+        return math.isclose(before.value, after.value, rel_tol=1e-12, abs_tol=1e-12)
+    return before.value == after.value
 
 
 def verify(folder: Path, project_id: int) -> None:
@@ -36,7 +46,7 @@ def verify(folder: Path, project_id: int) -> None:
                 continue
             source, filled = original.sheet_by_name(name), book.sheet_by_name(name)
             assert (source.nrows, source.ncols) == (filled.nrows, filled.ncols), (path, name)
-            assert all(source.cell_value(row, col) == filled.cell_value(row, col)
+            assert all(same_template_cell(source.cell(row, col), filled.cell(row, col))
                        for row in range(source.nrows) for col in range(source.ncols)), (path, name)
         total = book.sheet_by_name('Total')
         changed_total.append(sum(total.cell_value(row, col) != original_total.cell_value(row, col)

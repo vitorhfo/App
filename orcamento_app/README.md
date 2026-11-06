@@ -68,6 +68,28 @@ Veja [MAPA_FONTES.md](MAPA_FONTES.md) para fórmulas/unidades, [REGRESSOES.md](R
 
 ## Estrutura
 
+### Proteção das leituras entre formatos
+
+Os leitores agora ficam em `reader_profiles/`: CAD, grades técnicas, listas RISE
+em texto, listas de sete colunas e OCR têm módulos próprios. O reconhecimento é
+pelo formato da tabela; o nome do cliente não escolhe o leitor. `router.py`
+centraliza a precedência das grades técnicas, preservando múltiplas tabelas na
+mesma folha. `reader_v3.py` mantém a montagem da hierarquia e as entradas usadas
+pelos scripts existentes.
+
+As sete amostras em `regression_baselines/` protegem os campos de cada peça e os
+arquivos de origem. São referências do comportamento anterior, não aprovação
+de dados ainda pendentes. `py -3 reading_regression.py --output
+data/audits/comparacao_leituras.json` produz diferenças por campo sem alterar o
+banco. A suíte completa inclui essa comparação e falha se faltar uma amostra.
+
+Na lista de materiais, **Como o projeto foi lido** mostra os formatos reconhecidos,
+o PDF/página, a quantidade de linhas e a razão da escolha da lista principal.
+O registro é da última importação; edições posteriores continuam na lista e no
+histórico. Projetos antigos mostram que não há registro, até uma nova importação.
+Não é necessário reimportar orçamentos existentes apenas para instalar a mudança.
+O relatório é gravado na mesma transação dos materiais e não cria chamadas de IA.
+
 - `app.py`: interface/API local e aprovações.
 - `reader_v3.py`: leitura de PDFs e árvore de conjuntos.
 - `sync_mirrored_parts.py`: complementa um projeto já importado com componentes espelhados, preservando ajustes e preços existentes e criando cópia de segurança do banco antes da alteração.
@@ -80,3 +102,22 @@ Veja [MAPA_FONTES.md](MAPA_FONTES.md) para fórmulas/unidades, [REGRESSOES.md](R
 - `data/orcamento.db`: projetos de exemplo; faça cópia deste arquivo para backup dos seus orçamentos.
 
 O aplicativo funciona sem Notion ou arquivos originais após a importação de cada projeto. A exportação exata dos dois modelos exige Microsoft Excel instalado no Windows; abrir a página PDF de origem depende de a pasta do projeto continuar no mesmo caminho. Preços aprovados são copiados ao banco.
+
+
+### Formatos adicionais conferidos no acervo da empresa
+
+A seleção de PDFs usa rótulos explícitos de pasta/arquivo, preservando nomes como
+`7 PARTES`. Os leitores CAD por células reconhecem `Nº ITEM / Nº DA PEÇA /
+DESCRIÇÃO / QTD`, `ITEM / QTD / DESCRIÇÃO` (incluindo cabeçalho inferior), a grade
+CAD com descrição quebrada e código vazio e `POS / QTDE / CÓDIGO / MATERIAL / PESO`.
+Cortes de arame explicitamente descritos na lista conservam comprimento nominal
+e consumo com 20 mm extras separados. Perfis comerciais não viram comprimentos
+de corte. Peso sem unidade e subconjuntos sem detalhamento continuam pendentes.
+Na planilha de custo, arames descritos apenas por diâmetro e comprimento são
+agrupados por estoque; cada corte continua separado no CÁLCULO, preservando
+distinções explícitas de material como INOX e BTC.
+
+As correções são testadas nas cópias locais da auditoria, com comparação dos
+pacotes já reconhecidos. Nenhuma correção reimporta automaticamente orçamentos
+salvos ou altera arquivos da rede. Os resultados antes da mudança permanecem
+separados dos resultados posteriores em `data/audits/company_coverage_20261106/`.

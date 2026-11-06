@@ -13,6 +13,24 @@ from template_reports import (_aggregate_cost_items, _calc_pages, _cost_item,
 
 
 class CompanyTemplateTest(unittest.TestCase):
+    def test_wire_cut_lengths_share_stock_but_keep_cuts_and_different_grades(self):
+        def wire(name,material,length,quantity,weight):
+            return dict(description=name,material=material,group_name='Arame',item_type='materia_prima',
+                        radius_diam=6,length=length,quantity=quantity,unit='un',unit_weight=weight,
+                        total_weight=weight*quantity,unit_price=None,total_price=None)
+        materials=[wire('CORTE A','ARAME Ø6 x 200',200,2,.1),
+                   wire('CORTE B','ARAME Ø6 x 400',400,1,.2),
+                   wire('INOX','ARAME INOX Ø6',300,1,.3)]
+        groups=_split_items(materials)
+        self.assertEqual(len(groups['wire']),3)
+        aggregated=_aggregate_cost_items(groups['wire'],'wire')
+        self.assertEqual(len(aggregated),2)
+        ordinary=next(item for item in aggregated if 'INOX' not in item['material'])
+        self.assertAlmostEqual(ordinary['total_weight'],.4)
+        self.assertEqual(ordinary['aggregate_count'],2)
+        pages=_calc_pages(groups)
+        self.assertEqual([pages[0][f'C{row}'] for row in (17,18,19)],[2,1,1])
+
     def test_cost_mp_uses_material_names_and_aggregated_kg(self):
         def mp(description, material, group_name, weight, **dimensions):
             return {"description": description, "material": material,

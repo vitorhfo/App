@@ -119,6 +119,11 @@
           <small class="ai-import-pending-status">Selecione um projeto para conferir as cotas encontradas.</small>
         </div>
 
+        <details class="pdf-inventory" id="reading-report-panel">
+          <summary>Como o projeto foi lido</summary>
+          <div class="pdf-inventory-body" id="reading-report-content">Selecione um projeto para conferir a leitura.</div>
+        </details>
+
         <details id="project-pdfs-panel" class="pdf-inventory">
           <summary>PDFs do projeto (<span id="project-pdfs-count">0</span>) <small id="project-pdfs-warning"></small></summary>
           <div class="pdf-inventory-body">
@@ -637,7 +642,7 @@
     </div>
   </div>
 
-  <script src="/static/js/main.js?v=20261030-manual-save-pdf-page"></script>
+  <script src="/static/js/main.js?v=20261106-reading-profiles"></script>
   <script src="/static/js/quote_views.js?v=20261021-quote-views"></script>
   <script src="/static/react/vendor/react.production.min.js?v=18.3.1"></script>
   <script src="/static/react/vendor/react-dom.production.min.js?v=18.3.1"></script>

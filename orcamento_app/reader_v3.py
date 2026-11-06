@@ -1,23 +1,37 @@
 """Conservative local PDF reader. Every uncertain field remains reviewable."""
 from collections import defaultdict
 from pathlib import Path
-import json
-import os
 import re
 import shutil
 import subprocess
-import unicodedata
 import uuid
 
 import pymupdf
 
+# Keep these public names available to the existing import/repair scripts.
+from reader_profiles.common import (
+    norm, num, inch_mm, table_measure, table_diameter, material_cell_spec, INCH_SIZE,
+)
+from reader_profiles.cad import cad_bom
+from reader_profiles.cad_part_number import is_part_only_bom, cad_row_details, primary_cad_tables
+from reader_profiles.selection import is_technical_pdf
+from reader_profiles.technical import (
+    technical_grid_bom, ordered_rise_grid_bom, compact_rise_cut_bom,
+    technical_drawing_code, technical_subassembly_group, normalize_mdf_grid_dimensions,
+    fallback_technical_description, technical_title_dimensions,
+)
+from reader_profiles.scanned import (
+    windows_ocr_image_lines, windows_ocr_pixmap_lines, windows_ocr_lines,
+    scanned_rise_grid_candidate, normalize_ocr_numeric_code, scanned_rise_grid_bom,
+    scanned_technical_bom,
+)
+from reader_profiles.rise_text import rise_bom
+from reader_profiles.outpromo import (
+    outpromo_bom, outpromo_detail_dimensions, outpromo_detail_key, can_base_drawn_dimensions,
+)
+from reader_profiles.router import read_technical_table, technical_table_bom, record_reading
+
 from calc_engine import calc_sheet, calc_wire, calc_tube_rect, calc_tube_round, resolve_material_group
-
-
-def norm(value):
-    value = unicodedata.normalize('NFKD', str(value or ''))
-    value = ''.join(c for c in value if not unicodedata.combining(c))
-    return re.sub(r'[^A-Z0-9]+', ' ', value.upper()).strip()
 
 
 def side_and_base(description):
@@ -57,43 +71,6 @@ def mirror_instruction(text):
                           normalized))
 
 
-def num(value):
-    try:
-        return float(str(value).replace(' ', '').replace(',', '.'))
-    except (TypeError, ValueError):
-        return 0.0
-
-
-INCH_SIZE=r"(\d+(?:\s*[-/]\s*\d+)?)\s*(?:\"|'{1,2})"
-
-
-def inch_mm(value):
-    """Read fractional inch sizes, including CAD's 1-2'' spelling for 1/2''."""
-    parts=re.split(r'\s*[-/]\s*',value)
-    if len(parts)==2:
-        denominator=float(parts[1])
-        return round(25.4*float(parts[0])/denominator,6) if denominator else 0.0
-    return round(25.4*num(value),6)
-
-
-def table_measure(value):
-    """Numeric CAD cell, optionally followed by the printed mm unit."""
-    cleaned=str(value or '').strip().replace(' ', '')
-    match=re.fullmatch(r'(\d+(?:[,.]\d+)?)(?:mm)?',cleaned,re.I)
-    return num(match.group(1)) if match else num(cleaned)
-
-
-def table_diameter(value):
-    """Return diameter; an explicit radius marker is doubled."""
-    cleaned=str(value or '').strip()
-    match=re.fullmatch(r'(RAIO|R\.?|DI[ÂA]METRO|DIAM\.?|Ø)?\s*(\d+(?:[,.]\d+)?)\s*(?:mm)?',
-                       cleaned,re.I)
-    if not match: return 0.0,False
-    measure=num(match.group(2))
-    is_radius=bool(match.group(1) and norm(match.group(1)) in ('R','RAIO'))
-    return (measure*2 if is_radius else measure),is_radius
-
-
 def page_text(page):
     text = page.get_text()
     if len(text.strip()) > 40:
@@ -108,1117 +85,6 @@ def page_text(page):
         return result.stdout or text, True
     finally:
         image.unlink(missing_ok=True)
-
-
-def cad_bom(text):
-    lines = [x.strip() for x in text.splitlines() if x.strip()]
-    start = next((i for i in range(len(lines)-2) if norm(lines[i]) in ('N', 'NO', 'N ITEM')
-                  and norm(lines[i+1]).startswith('DESCRI')
-                  and (norm(lines[i+2]).startswith('QTD') or
-                       (i+3<len(lines) and norm(lines[i+2]).startswith('CODIGO')
-                        and norm(lines[i+3]).startswith('QTD')))), None)
-    if start is None:
-        return []
-    has_code=norm(lines[start+2]).startswith('CODIGO')
-    result=[]; i=start+(4 if has_code else 3)
-    while i < len(lines):
-        if 'PESO LIQ' in norm(lines[i]) or 'SISTEMA' in norm(lines[i]) or 'LOCAL DIGITAL' in norm(lines[i]):
-            break
-        m=re.fullmatch(r'(\d{1,3})(?:\s+(.+))?', lines[i])
-        if not m:
-            i+=1; continue
-        item=int(m.group(1)); desc=m.group(2)
-        if not desc:
-            if i+1>=len(lines): break
-            desc=lines[i+1]; i+=1
-        if not re.search(r'[A-Za-zÀ-ÿ]', desc) or norm(desc) in ('ITEM','ESCALA'):
-            i+=1; continue
-        code=''
-        if has_code and i+1 < len(lines) and lines[i+1]=='-':
-            i+=1  # Empty code cell on parameterized parts.
-        elif has_code and i+1 < len(lines) and not re.fullmatch(r'\d{1,3}', lines[i+1]):
-            maybe=lines[i+1]
-            if re.fullmatch(r'[A-Z0-9.\-]{4,25}', maybe) and not re.match(r'^\d+:', maybe):
-                code=maybe; i+=1
-        if i+1>=len(lines) or not re.fullmatch(r'\d{1,4}',lines[i+1]):
-            i+=1; continue
-        qty=int(lines[i+1]); i+=2
-        if qty<=0 or qty>10000: continue
-        result.append({'item_num':item,'description':desc,'raw_code':code,'quantity':qty})
-    return result
-
-
-def technical_grid_bom(page):
-    """Read CAD material tables by their drawn cells, including empty columns.
-
-    Text order omits blank cells, so a flat number sequence cannot distinguish
-    width from depth or preserve the MP code and observation reliably.
-    """
-    words=page.get_text('words')
-    if not words: return []
-    lines=[]
-    for drawing in page.get_drawings():
-        for element in drawing['items']:
-            if element[0]=='l': lines.append(element[1:3])
-    headers=[]
-    for word in words:
-        if norm(word[4])!='ITEM': continue
-        y=word[1]
-        headings={norm(other[4]) for other in words if abs(other[1]-y)<2}
-        if {'QTD','DESCRICAO','GRUPO','MATERIAL','DESENHO','PESO'}<=headings:
-            headers.append(y)
-    result=[]
-    for y in headers:
-        vertical=[]
-        for p1,p2 in lines:
-            if abs(p1.x-p2.x)>0.25: continue
-            low,high=sorted((p1.y,p2.y))
-            if low<=y<=high and 8<high-low<60:
-                vertical.append(round(p1.x,1))
-        edges=sorted(set(vertical))
-        if len(edges)!=15: continue  # 14 named columns, 15 cell borders.
-        horizontal=[]
-        first,second=edges[:2]
-        for p1,p2 in lines:
-            if abs(p1.y-p2.y)>0.25: continue
-            left,right=sorted((p1.x,p2.x))
-            if abs(left-first)<0.5 and abs(right-second)<0.5 and p1.y>y:
-                horizontal.append(round(p1.y,1))
-        rows=sorted(set(horizontal))
-        if len(rows)<2: continue
-        for top,bottom in zip(rows,rows[1:]):
-            if bottom-top<4 or bottom-top>90: continue
-            cells=[[] for _ in range(14)]
-            for word in words:
-                mid_y=(word[1]+word[3])/2
-                if not top+0.1<mid_y<bottom-0.1: continue
-                mid_x=(word[0]+word[2])/2
-                column=next((i for i in range(14)
-                             if edges[i]<=mid_x<edges[i+1]),None)
-                if column is not None:
-                    cells[column].append(word)
-            values=[' '.join(w[4] for w in sorted(cell,key=lambda x:(round(x[1],1),x[0]))).strip()
-                    for cell in cells]
-            if not re.fullmatch(r'\d{1,3}',values[0]) or not re.fullmatch(r'\d{1,4}',values[1]):
-                continue
-            if not values[3]: continue
-            description=values[2]
-            if not description and norm(values[3])=='ACESSORIO' and values[4]:
-                # RISE accessory rows put the physical item only in MATERIAL.
-                description=values[4]
-            if not description: continue
-            observation='' if values[13]=='.' else values[13].lstrip('.').strip()
-            diameter,is_radius=table_diameter(values[6])
-            if is_radius:
-                observation=' '.join(x for x in (observation,
-                    f'Raio {values[6]} convertido para diâmetro {diameter:g} mm.') if x)
-            printing_hint=''
-            if norm(values[3]) in ('PS','PSAI','PETG','PET','ACRILICO') and 'IMPRESS' in norm(observation):
-                printing_hint=('frente e verso' if re.search(r'FRENTE\s+E?\s*VERSO|DOIS\s+LADOS',
-                               norm(observation)) else 'frente')
-            result.append({'item_num':int(values[0]),'quantity':int(values[1]),
-                           'description':description,'group':values[3],
-                           'material':values[4], 'thickness':table_measure(values[5]),
-                           'diameter':diameter,'width':table_measure(values[7]),
-                           'depth':table_measure(values[8]),'length':table_measure(values[9]),
-                           'drawing_id':values[10],
-                           'unit_weight':num(values[11]),
-                           'raw_code':'' if values[12]=='.' else values[12],
-                           'observation':observation,'printing_hint':printing_hint})
-    return result
-
-
-def ordered_rise_grid_bom(page, separate=False):
-    """RISE grids with varying DESENHO/QTD positions (DOCILE, P&G, RISE).
-
-    Use cell coordinates because PDF text order loses empty cells and wrapped
-    descriptions; the older ITEM/QTD/DESCRIÇÃO layout is handled separately.
-    """
-    words = page.get_text('words')
-    headers = []
-    for item in words:
-        if norm(item[4]) != 'ITEM':
-            continue
-        same_line = [word for word in words if abs(word[1] - item[1]) < 2]
-        ordered = [norm(word[4]) for word in sorted(same_line, key=lambda word: word[0])]
-        variants = (
-            # RISE part drawings also use a 14-column grid with a separate
-            # item number and quantity, then drawing code, description, and
-            # the table-stamped mass/area. Match by cell coordinates before
-            # falling back to line-order parsing, which loses empty cells.
-            (('ITEM','QTD','DESENHO','DESCRI','GRUPO','MATERIAL','ESPESSURA',
-              'LARGURA','ALTURA','COMPRIMENTO','PESO','AREA','OBSERVA'),
-             {'quantity':1,'drawing':2,'description':3,'group':4,'material':5,
-              'thickness':6,'diameter':7,'width':8,'depth':9,'length':10,
-              'unit_weight':11,'unit_area':12,'observation':13},15),
-            (('ITEM', 'DESENHO', 'DESCRI', 'GRUPO', 'MATERIAL', 'QTD',
-              'ESPESSURA', 'COMPRIMENTO', 'PESO', 'OBSERVA'),
-             {'drawing': 1, 'description': 2, 'group': 3, 'material': 4, 'quantity': 5,
-              'thickness': 6, 'diameter': 7, 'width': 8, 'depth': 9, 'length': 10,
-              'unit_weight':11,'unit_area':12,'observation':15},16),
-            (('ITEM', 'QTD', 'DESCRI', 'DESENHO', 'GRUPO', 'MATERIAL',
-              'ESPESSURA', 'COMPRIMENTO', 'PESO', 'OBSERVA'),
-             {'drawing': 3, 'description': 2, 'group': 4, 'material': 5, 'quantity': 1,
-              'thickness': 6, 'diameter': 7, 'width': 8, 'depth': 9, 'length': 10,
-              'unit_weight':11,'unit_area':12,'observation':15},16),
-            (('ITEM', 'QTD', 'DESCRI', 'GRUPO', 'MATERIAL', 'ESPESSURA',
-              'COMPRIMENTO', 'DESENHO', 'PESO', 'OBSERVA'),
-             {'drawing': 10, 'description': 2, 'group': 3, 'material': 4, 'quantity': 1,
-              'thickness': 5, 'diameter': 6, 'width': 7, 'depth': 8, 'length': 9,
-              'unit_weight':11,'unit_area':12,'observation':15},16),
-            # Newer HH GLOBAL/RISE exports use a 12-column list with the drawing
-            # code before its description and no weight/area columns. Preserve
-            # the explicit unit, width and cut length from the table cells.
-            (('ITEM','DESENHO','DESCRI','DET','GRUPO','MATERIAL','QTD','UNID',
-              'LARGURA','COMPRIMENTO','TRATAMENTO','OBSERVA'),
-             {'drawing':1,'description':2,'group':4,'material':5,'quantity':6,
-              'unit':7,'width':8,'length':9,'finish':10,'observation':11},13),
-            # Related HH GLOBAL/RISE exports omit the DET column. Keep this
-            # distinct header shape so the project BOM is still recognized;
-            # drawing code, unit, and dimensions remain in their own cells.
-            (('ITEM','DESENHO','DESCRI','GRUPO','MATERIAL','QTD','UNID',
-              'LARGURA','COMPRIMENTO','TRATAMENTO','OBSERVA'),
-             {'drawing':1,'description':2,'group':3,'material':4,'quantity':5,
-              'unit':6,'width':7,'length':8,'finish':9,'observation':10},12),
-        )
-        for required, columns, edge_count in variants:
-            positions = [next((i for i, value in enumerate(ordered)
-                               if value.startswith(name)), -1) for name in required]
-            if all(pos >= 0 for pos in positions) and positions == sorted(positions):
-                headers.append((item, columns, edge_count))
-                break
-    if not headers:
-        return []
-    lines = [element[1:3] for drawing in page.get_drawings()
-             for element in drawing['items'] if element[0] == 'l']
-    result = []
-    sections = []
-    for header, columns, edge_count in headers:
-        y = (header[1] + header[3]) / 2
-        vertical = sorted({round(a.x, 1) for a, b in lines
-                           if abs(a.x-b.x) < .25 and min(a.y,b.y) <= y <= max(a.y,b.y)
-                           and a.x >= header[0]-5})
-        left_edges = [x for x in vertical if x <= header[0] and header[0]-x < 5]
-        if not left_edges:
-            continue
-        first = max(left_edges)  # Exclude a nearby page border.
-        edges = [x for x in vertical if x >= first]
-        if edge_count == 13:
-            same_line=[word for word in words if abs(word[1]-header[1])<2]
-            right_limit=max(word[2] for word in same_line)+30
-            filtered=[]
-            for x in (value for value in edges if value<=right_limit):
-                if filtered and x-filtered[-1]<5:
-                    filtered[-1]=x
-                else:
-                    filtered.append(x)
-            edges=filtered
-        else:
-            edges=edges[:edge_count]
-        if len(edges) != edge_count:
-            continue
-        if not all(edges[i+1]-edges[i] > 10 for i in range(edge_count-1)):
-            continue
-        horizontal = sorted({round(a.y, 1) for a, b in lines
-                             if abs(a.y-b.y) < .25 and abs(a.x-edges[0]) < .35
-                             and abs(b.x-edges[1]) < .35 and a.y >= header[1]-10})
-        if len(horizontal) < 3:
-            continue
-        section = []
-        last_bottom = y
-        for top, bottom in zip(horizontal[1:], horizontal[2:]):
-            cells = []
-            for left, right in zip(edges, edges[1:]):
-                contents = [word for word in words
-                            if left < (word[0]+word[2])/2 < right
-                            and top < (word[1]+word[3])/2 < bottom]
-                cells.append(' '.join(word[4] for word in sorted(contents,
-                                   key=lambda word: (round(word[1], 1), word[0]))).strip())
-            if not re.fullmatch(r'\d{1,3}', cells[0]):
-                if section:
-                    break
-                continue
-            # Some RISE tables let the first word of DESCRIÇÃO overhang the
-            # narrow QTD cell (VEJA: "0.08 4 PLASTICO BOLHA"). Parse the
-            # first numeric token instead of concatenating every digit.
-            quantity_cell = cells[columns['quantity']]
-            quantity_token = re.match(r'^\s*\d+(?:[,.]\d+)?', quantity_cell)
-            quantity = (table_measure(quantity_token.group())
-                        if quantity_token else 0)
-            if quantity <= 0:
-                continue
-            description = cells[columns['description']]
-            if quantity_token:
-                overflow = quantity_cell[quantity_token.end():].strip()
-                if overflow:
-                    description = f'{overflow} {description}'.strip()
-            def cell(name):
-                index=columns.get(name)
-                return cells[index] if index is not None and index<len(cells) else ''
-            group = cell('group')
-            material = cell('material')
-            # In some RISE 12-column exports the simplified description cell
-            # contains only the final wrapped words, while MATERIAL retains
-            # the complete catalog description. Recover only when the short
-            # cell is a suffix of the material text, avoiding broad merging.
-            if (description and material and len(norm(description).split()) <= 6 and
-                    norm(material).startswith(norm(description)) is False and
-                    norm(description) in norm(material)):
-                material_label = re.split(r'\s+-\s+\[(?:[A-Z0-9]+)\]', material, maxsplit=1)[0].strip()
-                if len(norm(material_label).split()) > len(norm(description).split()):
-                    description = material_label
-            row_dimensions = normalize_mdf_grid_dimensions(material, {
-                'thickness': table_measure(cell('thickness')),
-                'diameter': table_measure(cell('diameter')),
-                'width': table_measure(cell('width')),
-                'depth': table_measure(cell('depth')),
-                'length': table_measure(cell('length')),
-            })
-            if not description and group and re.search(r'\[(?:AC|EM)[A-Z0-9]+\]', material, re.I):
-                # RISE013 has an accessory name in GRUPO while DESCRIÇÃO is
-                # empty.  Keep the physical line instead of dropping it.
-                description, group = group, 'Acessório'
-            drawing = cell('drawing')
-            if not description and group and drawing:
-                # HEINZ/NEXXIA tables sometimes omit DESCRIÇÃO on every
-                # structural row; the physical drawing code remains present.
-                # Retain the row with a transparent code-based label so its
-                # material, cut dimensions, quantity and hierarchy are kept.
-                description = fallback_technical_description(group, material, drawing,
-                                                             **row_dimensions)
-            if not description:
-                continue
-            if not group and 'CAIXA' in norm(description):
-                group = 'Embalagem'
-            if not drawing or drawing == '.':
-                drawing = 'COMPRADO: ' + description
-            code = re.search(r'\[([A-Z0-9]+)\]', material, re.I)
-            treatment=cell('finish')
-            printing_match=re.search(r'\b([014]x[014])\b',treatment,re.I)
-            printing_hint=(printing_match.group(1).lower() if printing_match and
-                           norm(group) in ('PS','PSAI','PETG','PET','POLIMEROS') else '')
-            section.append({
-                'item_num': int(cells[0]), 'quantity': quantity,
-                'description': description, 'group': group, 'material': material,
-                **row_dimensions,
-                'drawing_id': drawing, 'raw_code': code.group(1) if code else '',
-                'unit':cell('unit') or 'un','finish':treatment,
-                'printing':printing_match.group(1).lower() if printing_match else '0x0',
-                'unit_weight': table_measure(cell('unit_weight')),
-                'unit_area': table_measure(cell('unit_area')),
-                'observation': cell('observation'), 'printing_hint': printing_hint,
-            })
-            last_bottom = bottom
-        if section:
-            result.extend(section)
-            sections.append((section, y, last_bottom))
-    return sections if separate else result
-
-
-def compact_rise_cut_bom(page):
-    """Seven-column subassembly cut lists: ITEM/QTD/DESCRIÇÃO/MATERIAL/Ø/COMP/DESENHO."""
-    words=page.get_text('words')
-    lines=[element[1:3] for drawing in page.get_drawings()
-           for element in drawing['items'] if element[0]=='l']
-    for header in words:
-        if norm(header[4])!='ITEM':
-            continue
-        same=[word for word in words if abs(word[1]-header[1])<2]
-        labels=[norm(word[4]) for word in sorted(same,key=lambda word:word[0])]
-        # The ordinary 14-column RISE grid contains all six labels below as
-        # well.  Its first seven columns can look like a compact cut table,
-        # but parsing them here shifts drawing IDs and drops the full BOM.
-        if any(any(label.startswith(extra) for label in labels)
-               for extra in ('GRUPO','ESPESSURA','LARGURA','PROFUNDIDADE','PESO')):
-            continue
-        expected=('ITEM','QTD','DESCRI','MATERIAL','COMPRIMENTO','DESENHO')
-        positions=[next((i for i,label in enumerate(labels)
-                         if label.startswith(name)),-1) for name in expected]
-        if not all(pos>=0 for pos in positions) or positions!=sorted(positions):
-            continue
-        y=(header[1]+header[3])/2
-        vertical=sorted({round(a.x,1) for a,b in lines
-                         if abs(a.x-b.x)<.25 and min(a.y,b.y)<=y<=max(a.y,b.y)
-                         and a.x>=header[0]-5})
-        first=max((x for x in vertical if x<=header[0] and header[0]-x<5),default=None)
-        if first is None:
-            continue
-        edges=[x for x in vertical if x>=first][:8]
-        if len(edges)!=8 or not all(edges[i+1]-edges[i]>10 for i in range(7)):
-            continue
-        horizontal=sorted({round(a.y,1) for a,b in lines
-                           if abs(a.y-b.y)<.25 and abs(a.x-edges[0])<.35
-                           and abs(b.x-edges[1])<.35 and a.y>=header[1]-10})
-        result=[]
-        for top,bottom in zip(horizontal[1:],horizontal[2:]):
-            cells=[]
-            for left,right in zip(edges,edges[1:]):
-                contents=[word for word in words
-                          if left<(word[0]+word[2])/2<right
-                          and top<(word[1]+word[3])/2<bottom]
-                cells.append(' '.join(word[4] for word in sorted(contents,
-                    key=lambda word:(round(word[1],1),word[0]))).strip())
-            if not re.fullmatch(r'\d{1,3}',cells[0]):
-                if result: break
-                continue
-            quantity=table_measure(cells[1].split()[0]) if cells[1] else 0
-            if quantity<=0 or not cells[2]: continue
-            material=cells[3]
-            group=('Arame' if 'ARAME' in norm(material) else
-                   'Chapa de Aço' if 'CHAPA DE ACO' in norm(material) else '')
-            if not group: continue
-            gauge=re.search(r'(\d+(?:[,.]\d+)?)\s*mm',material,re.I)
-            code=re.search(r'\[([A-Z0-9]+)\]',material,re.I)
-            result.append({
-                'item_num':int(cells[0]),'quantity':quantity,
-                'description':cells[2],'group':group,'material':material,
-                'thickness':num(gauge.group(1)) if gauge and group!='Arame' else 0,
-                'diameter':table_measure(cells[4]) if group=='Arame' else 0,
-                'width':0,'depth':0,'length':table_measure(cells[5]),
-                'drawing_id':cells[6],'raw_code':code.group(1) if code else '',
-                'unit_weight':0,'observation':'','printing_hint':'',
-                'compact_cut':True,
-            })
-        if result:
-            return result
-    return []
-
-
-def technical_table_bom(text, page=None):
-    """Read the ITEM/QTD/DESENHO/PESO tables in multi-sheet technical PDFs.
-
-    These tables can appear again on detail pages. The caller selects the
-    assembly page, then follows drawing identifiers instead of counting every
-    repeated detail table as a new product.
-    """
-    if page is not None:
-        ordered_rows=ordered_rise_grid_bom(page)
-        if ordered_rows: return ordered_rows
-        compact_rows=compact_rise_cut_bom(page)
-        if compact_rows: return compact_rows
-        grid_rows=technical_grid_bom(page)
-        if grid_rows: return grid_rows
-    if not re.search(r'(?im)^ITEM\s+QTD\s*\n\s*DESCRI', text): return []
-    lines=[x.strip() for x in text.splitlines() if x.strip()]
-    starts=[]
-    for i in range(len(lines)-2):
-        if norm(lines[i])!='ITEM QTD' or not norm(lines[i+1]).startswith('DESCRI'):
-            continue
-        header_end=next((j for j in range(i+2,min(i+20,len(lines)))
-                         if norm(lines[j]).startswith('OBSERVA')),None)
-        if header_end is not None: starts.append(header_end+1)
-    if not starts: return []
-    group_names=('SUB CONJUNTO','CHAPA DE ACO','TUBO QUADRADO','TUBO REDONDO',
-                 'ARAME','ACESSORIO','PS','PSAI','PETG','PET','MADEIRA','PAPELAO','ACRILICO')
-    rows=[]
-    for start in starts:
-        end=next((j for j in range(start,len(lines)) if norm(lines[j]).startswith('RESERVADO TODOS')),
-                 len(lines))
-        next_header=next((j for j in range(start,end) if norm(lines[j])=='LISTA DE MATERIAIS'
-                         and j+1<end and norm(lines[j+1])=='ITEM QTD'),end)
-        end=min(end,next_header)
-        candidates=[]
-        for i in range(start,end-3):
-            if not re.fullmatch(r'\d{1,2}',lines[i]) or not re.fullmatch(r'\d{1,3}',lines[i+1]):
-                continue
-            if not re.search(r'[A-Za-zÀ-ÿ]',lines[i+2]): continue
-            if any(norm(lines[j]) in group_names or norm(lines[j])=='TUBO'
-                   for j in range(i+3,min(i+8,end))):
-                candidates.append(i)
-        for n,i in enumerate(candidates):
-            stop=candidates[n+1] if n+1<len(candidates) else end
-            body=lines[i+2:stop]
-            group_index=next((j for j,x in enumerate(body) if norm(x) in group_names or norm(x)=='TUBO'),None)
-            if group_index is None or group_index==0: continue
-            desc=' '.join(body[:group_index]).strip()
-            group=body[group_index]
-            offset=group_index+1
-            if norm(group)=='TUBO' and offset<len(body) and norm(body[offset]) in ('QUADRADO','REDONDO'):
-                group+=' '+body[offset]; offset+=1
-            if norm(group)=='SUB CONJUNTO' and offset<len(body) and norm(body[offset])=='SUB CONJUNTO':
-                offset+=1
-            drawing_index=next((j for j in range(offset,len(body))
-                                if technical_drawing_code(body[j])),None)
-            bought=norm(group)=='ACESSORIO' and drawing_index is None
-            if drawing_index is None and not bought: continue
-            if bought:
-                code=body[-1] if body and re.fullmatch(r'\d{7,10}',body[-1]) else ''
-                weight=num(body[-2]) if code and len(body)>=2 else 0.0
-                rows.append({'item_num':int(lines[i]),'quantity':int(lines[i+1]),
-                    'description':desc,'group':group,'material':' '.join(body[offset:-2]),
-                    'thickness':0.0,'width':0.0,'depth':0.0,'length':0.0,'diameter':0.0,
-                    'drawing_id':'COMPRADO: '+desc,'raw_code':code,'unit_weight':weight,
-                    'observation':'','printing_hint':''})
-                continue
-            drawing=body[drawing_index]
-            if (drawing_index and re.search(r'_[MP]\d{1,3}[-_]?REV\d+',drawing,re.I)
-                    and re.search(r'[A-Za-z]',body[drawing_index-1])):
-                drawing=body[drawing_index-1]+' '+drawing
-            drawing=' '.join(drawing.split())
-            measures=[num(x) for x in body[offset:drawing_index]
-                      if re.fullmatch(r'\d+(?:[,.]\d+)?',x)]
-            material_parts=[]
-            for x in body[offset:drawing_index]:
-                if re.fullmatch(r'\d+(?:[,.]\d+)?|\.',x): break
-                material_parts.append(x)
-            material=' '.join(material_parts).strip()
-            after=body[drawing_index+1:]
-            grid_numbers=(len(after)>=3 and after[:3]==['1','2','3'])
-            weight=0.0 if grid_numbers else (num(after[0]) if after else 0.0)
-            code=after[1] if not grid_numbers and len(after)>1 and re.fullmatch(
-                r'(?:\{?MP\d{5,}\}?|\d{7,10})',after[1],re.I) else ''
-            note_parts=[] if grid_numbers else after[2 if code else 1:]
-            observation=' '.join(note_parts).lstrip('.').strip()
-            printing_hint=''
-            if norm(group) in ('PS','PSAI','PETG','PET','ACRILICO') and 'IMPRESS' in norm(observation):
-                printing_hint=('frente e verso' if re.search(r'FRENTE\s+E?\s*VERSO|DOIS\s+LADOS',norm(observation))
-                               else 'frente')
-            thickness=width=depth=length=diameter=0.0
-            if norm(group)=='TUBO QUADRADO' and len(measures)>=4:
-                thickness,width,depth,length=measures[:4]
-            elif norm(group)=='ARAME' and len(measures)>=2:
-                diameter,length=measures[0],measures[-1]
-            elif len(measures)>=3:
-                thickness,width,length=measures[:3]
-            elif len(measures)>=2:
-                width,length=measures[:2]
-            rows.append({'item_num':int(lines[i]),'quantity':int(lines[i+1]),
-                         'description':desc,'group':group,'material':material,
-                         'thickness':thickness,'width':width,'depth':depth,'length':length,
-                         'diameter':diameter,'drawing_id':drawing,'raw_code':code,
-                         'unit_weight':weight,'observation':observation,
-                         'printing_hint':printing_hint})
-    unique={}
-    for row in rows:
-        key=(row['item_num'],norm(row['drawing_id']),norm(row['description']))
-        unique[key]=row
-    return list(unique.values())
-
-
-def technical_drawing_code(value):
-    return re.search(r'(?:_[MP]\d{1,3}[-_]?REV\d+|\b(?:[A-Z]{2,5}|P&G)\d{3,}[MP]\d{2,3}\b)',value,re.I)
-
-
-def technical_subassembly_group(value):
-    return norm(value) in ('SUB CONJUNTO', 'SUB MONTAGEM', 'SUB PRODUTO')
-
-
-def normalize_mdf_grid_dimensions(material, dimensions):
-    """Correct a documented RISE MDF grid shift only when its material gauge agrees.
-
-    Small MDF strips in the Heinz/NEXXIA table place the long side under
-    ESPESSURA, the material gauge under the next numeric field, and the strip
-    width under LARGURA. The stock material independently specifies the gauge.
-    """
-    result = dict(dimensions)
-    if 'MDF' not in norm(material):
-        return result
-    gauge = material_cell_spec(material).get('thickness', 0)
-    if (gauge > 0 and result.get('thickness', 0) > max(gauge * 2, 30)
-            and not result.get('depth')
-            and abs(result.get('width', 0) - gauge) <= max(0.1, gauge * 0.01)
-            and result.get('length', 0) > 0):
-        result['length'] = result['thickness']
-        result['thickness'] = gauge
-        result['width'] = dimensions['length']
-        result['diameter'] = 0
-    return result
-
-
-def fallback_technical_description(group, material, drawing_id, *, thickness=0,
-                                   diameter=0, width=0, depth=0, length=0):
-    """Build an honest stable label when a CAD BOM leaves DESCRIÇÃO blank.
-
-    Some SolidWorks/NEXXIA exports put only the role, stock description and
-    drawing number in the row. Keep that physical row and identify it from its
-    drawing; never treat a commercial sheet size as the finished part size.
-    """
-    drawing = str(drawing_id or '').strip()
-    role = norm(group)
-    material_text = norm(material)
-    if technical_subassembly_group(group):
-        return f'SUBPRODUTO {drawing}'.strip()
-    if 'TUBO' in material_text or 'METALON' in material_text:
-        profile = 'QUADRADO' if 'QUADRADO' in material_text else 'RETANGULAR'
-        section = f'{width:g}X{depth:g}' if width and depth else ''
-        gauge = f'X{thickness:g}MM' if thickness else ''
-        return f'TUBO {profile} {section}{gauge} - {drawing}'.strip(' -')
-    if 'MDF' in material_text:
-        dims = 'X'.join(f'{value:g}' for value in (width, length) if value)
-        gauge = f'X{thickness:g}MM' if thickness else ''
-        return f'MDF {dims}{gauge} - {drawing}'.strip(' -')
-    if any(token in material_text for token in ('PSAI', 'ACRILICO', 'PVC', 'PETG')):
-        kind = next((token for token in ('PSAI', 'ACRILICO', 'PVC', 'PETG')
-                     if token in material_text), 'CHAPA')
-        color = next((token for token in ('BRANCO', 'PRETO', 'CRISTAL', 'LEITOSO')
-                      if token in material_text), '')
-        dims = 'X'.join(f'{value:g}' for value in (width, length) if value)
-        gauge = f'X{thickness:g}MM' if thickness else ''
-        return f'{kind} {color} {dims}{gauge} - {drawing}'.strip(' -')
-    if 'CHAPA' in material_text:
-        dims = 'X'.join(f'{value:g}' for value in (width, length) if value)
-        gauge = f'{thickness:g}MM' if thickness else ''
-        return f'CHAPA AÇO {gauge} {dims} - {drawing}'.strip(' -')
-    label = {'METAL': 'PEÇA METÁLICA', 'POLIMEROS': 'PEÇA POLIMÉRICA',
-             'ACESSORIOS': 'ACESSÓRIO', 'ACESSORIO': 'ACESSÓRIO'}.get(role, 'PEÇA')
-    return f'{label} {drawing}'.strip()
-
-
-def technical_title_dimensions(page):
-    """Dimensions printed beside labels in the bottom title block."""
-    words=page.get_text('words')
-    found={}
-    for field,label in (('length','COMPRIMENTO'),('width','LARGURA'),
-                        ('thickness','ESPESSURA')):
-        labels=[word for word in words if norm(word[4])==label
-                and word[1]>page.rect.height*.55]
-        if not labels:
-            continue
-        label_word=max(labels,key=lambda word:word[1])
-        values=[word for word in words
-                if 0<word[0]-label_word[2]<140
-                and abs((word[1]+word[3]-label_word[1]-label_word[3])/2)<2
-                and re.fullmatch(r'\d+(?:[,.]\d+)?',word[4])]
-        if values:
-            found[field]=num(min(values,key=lambda word:word[0])[4])
-    weights=re.findall(r'(?<![\w])([\d.,]+)\s*kg\b',page.get_text(),re.I)
-    if len(weights)==1:
-        found['unit_weight']=num(weights[0])
-    return found
-
-
-def windows_ocr_image_lines(image):
-    script=Path(__file__).with_name('ocr_windows.ps1')
-    if os.name!='nt' or not script.is_file(): return []
-    image=Path(image)
-    if not image.is_file(): return []
-    result=subprocess.run(['powershell.exe','-NoProfile','-ExecutionPolicy','Bypass',
-        '-File',str(script),'-ImagePath',str(image),'-Structured'],
-        capture_output=True,text=True,encoding='utf-8',errors='replace',timeout=90)
-    if result.returncode or not result.stdout.strip(): return []
-    parsed=json.loads(result.stdout)
-    return parsed if isinstance(parsed,list) else [parsed]
-
-
-def windows_ocr_pixmap_lines(pixmap):
-    image=Path(__file__).with_name('data')/f'ocr_{uuid.uuid4().hex}.png'
-    try:
-        pixmap.save(str(image))
-        return windows_ocr_image_lines(image)
-    finally:
-        image.unlink(missing_ok=True)
-
-
-def windows_ocr_lines(page):
-    return windows_ocr_pixmap_lines(page.get_pixmap(matrix=pymupdf.Matrix(2,2)))
-
-
-def scanned_rise_grid_candidate(ocr_lines):
-    """Recognize the 11-column RISE material-list header in a low-res scan."""
-    found={}
-    for line in ocr_lines:
-        if not isinstance(line,dict) or not line.get('text') or line.get('y',0)>90:
-            continue
-        text=norm(line['text'])
-        if 'DESENHO' in text: found['drawing']=line
-        if 'DESCRI' in text and 'SIMPLIFICADA' in text: found['description']=line
-        if 'GRUPO' in text: found['group']=line
-        if 'MATERIAL' in text: found['material']=line
-        if 'QTD' in text: found['quantity']=line
-        if 'UNID' in text: found['unit']=line
-        if 'LARGURA' in text: found['width']=line
-        if 'COMPRIMENTO' in text: found['length']=line
-        if 'TRATAMENTO' in text: found['finish']=line
-        if 'OBSERVA' in text: found['observation']=line
-    required={'drawing','description','material','quantity','width','length'}
-    if not required.issubset(found):
-        return False
-    # Reject unrelated OCR tables that happen to reuse generic column labels.
-    return (found['drawing']['x'] < found['description']['x']
-            < found['material']['x'] < found['quantity']['x']
-            and found['width']['x'] < found['length']['x'])
-
-
-def normalize_ocr_numeric_code(value):
-    """Repair common OCR confusions only for fixed-prefix, all-digit IDs."""
-    compact=re.sub(r'\s+','',str(value or ''))
-    match=re.fullmatch(r'(MP|PC|AC|EM|CJ)([A-Z0-9]{8})',compact,re.I)
-    if not match: return compact
-    suffix=(match.group(2).upper().replace('O','0').replace('C','0')
-            .replace('Q','0').replace('S','5').replace('I','1')
-            .replace('L','1').replace('T','1').replace('B','8'))
-    return match.group(1).upper()+suffix if suffix.isdigit() else compact
-
-
-def scanned_rise_grid_bom(page):
-    """Read a raster/vector-outline 11-column RISE BOM by its printed grid.
-
-    This layout has no weight column. Gauge/profile are parsed from MATERIAL,
-    while only the dedicated LARGURA/COMPRIMENTO cells become cut dimensions;
-    stock sheet sizes in MATERIAL never become piece dimensions.
-    """
-    vertical=defaultdict(list); horizontal=defaultdict(list)
-    for drawing in page.get_drawings():
-        for item in drawing['items']:
-            if item[0]!='l': continue
-            first,second=item[1:3]
-            dx=abs(first.x-second.x); dy=abs(first.y-second.y)
-            low_y,high_y=sorted((first.y,second.y))
-            if dx<0.15 and 7<dy<12.5 and 20<low_y<page.rect.height-20:
-                vertical[round(first.x,1)].append((low_y,high_y))
-            if dy<0.15 and dx>8 and 20<first.y<page.rect.height-20:
-                horizontal[round(first.y,1)].append(
-                    (min(first.x,second.x),max(first.x,second.x)))
-    if not vertical or not horizontal: return []
-    strongest=max(len(segments) for segments in vertical.values())
-    x_edges=sorted(x for x,segments in vertical.items()
-                   if len(segments)>=max(5,strongest*.65))
-    if len(x_edges)!=12: return []
-    left,right=x_edges[0],x_edges[-1]
-    y_edges=[]
-    for y,segments in horizontal.items():
-        clipped=sum(max(0,min(right,b)-max(left,a)) for a,b in segments)
-        if clipped>=(right-left)*.82 and len(segments)>=8:
-            y_edges.append(y)
-    y_edges=sorted(y_edges)
-    runs=[]; run=[]
-    for y in y_edges:
-        if run and not 7<=y-run[-1]<=12.5:
-            if len(run)>=4: runs.append(run)
-            run=[]
-        run.append(y)
-    if len(run)>=4: runs.append(run)
-    if not runs: return []
-    table_y=max(runs,key=len)
-    if len(table_y)<4: return []
-    # OCR is much more reliable on enlarged row strips than on a full-page
-    # table. Batch ten strips per call to keep Windows OCR startup affordable.
-    from io import BytesIO
-    from PIL import Image
-    data_rows=list(range(1,len(table_y)-1))  # first interval is the header
-    cells_by_row=[defaultdict(list) for _ in data_rows]
-    explicit_marks=defaultdict(list)
-    left=max(page.rect.x0,x_edges[0]); right=min(page.rect.x1,x_edges[-1])
-    scale=4; enlargement=2; gap=24; row_gap=20
-    table_clip=pymupdf.Rect(left,table_y[0],right,table_y[-1])
-    table_pixmap=page.get_pixmap(matrix=pymupdf.Matrix(scale,scale),
-                                 clip=table_clip,alpha=False)
-    table_image=Image.open(BytesIO(table_pixmap.tobytes('png'))).convert('RGB')
-    batch_size=10
-    for start in range(0,len(data_rows),batch_size):
-        row_indices=data_rows[start:start+batch_size]
-        strips=[]; segment_lists=[]
-        for row_index in row_indices:
-            source_top=round((table_y[row_index]-table_y[0])*scale)+1
-            source_bottom=round((table_y[row_index+1]-table_y[0])*scale)-1
-            row_cells=[]
-            for column in range(11):
-                source_left=round((x_edges[column]-left)*scale)+1
-                source_right=round((x_edges[column+1]-left)*scale)-1
-                cell_image=table_image.crop((source_left,source_top,
-                                             source_right,source_bottom))
-                cell_image=cell_image.resize((cell_image.width*enlargement,
-                    cell_image.height*enlargement),Image.Resampling.LANCZOS)
-                row_cells.append(cell_image)
-            row_width=sum(cell_image.width for cell_image in row_cells)+gap*10
-            strip_height=max(cell_image.height for cell_image in row_cells)
-            strip=Image.new('RGB',(row_width,strip_height),'white')
-            segment_bounds=[]; x_offset=0
-            for cell_image in row_cells:
-                strip.paste(cell_image,(x_offset,0))
-                segment_bounds.append((x_offset,x_offset+cell_image.width))
-                x_offset+=cell_image.width+gap
-            strips.append(strip); segment_lists.append(segment_bounds)
-        composite_height=sum(strip.height for strip in strips)+row_gap*(len(strips)-1)
-        composite=Image.new('RGB',(max(strip.width for strip in strips),composite_height),'white')
-        offsets=[]; offset=0
-        for strip in strips:
-            offsets.append(offset); composite.paste(strip,(0,offset)); offset+=strip.height+row_gap
-        image=Path(__file__).with_name('data')/f'ocr_{uuid.uuid4().hex}.png'
-        try:
-            composite.save(image)
-            lines=windows_ocr_image_lines(image)
-        finally:
-            image.unlink(missing_ok=True)
-        for line in lines:
-            text=str(line.get('text','')).strip()
-            if not text: continue
-            y=line.get('y',0)
-            local_batch=next((i for i,(top,strip) in enumerate(zip(offsets,strips))
-                              if top<=y<top+strip.height),None)
-            if local_batch is None: continue  # White row separator.
-            row_index=row_indices[local_batch]
-            x=line.get('x',0)
-            column=next((index for index,(cell_left,cell_right) in
-                         enumerate(segment_lists[local_batch])
-                         if cell_left<=x<cell_right),None)
-            if column is None: continue
-            if column==0:
-                token=norm(text).replace('O','0').replace('I','1').replace('L','1').replace('S','5')
-                if re.fullmatch(r'\d{1,3}',token): explicit_marks[row_index].append(int(token))
-                continue
-            cells_by_row[row_index-1][column].append((y,x,text))
-
-    def cell(values):
-        parts=[]; seen=set()
-        for _,_,text in sorted(values):
-            clean=' '.join(text.split())
-            if clean and norm(clean) not in seen:
-                parts.append(clean); seen.add(norm(clean))
-        return ' '.join(parts).strip()
-
-    def measure(value):
-        match=re.search(r'(?<![A-Z])\d{1,4}(?:[.,]\d+)?',str(value or ''),re.I)
-        return table_measure(match.group()) if match else 0.0
-
-    observed=[(index-1,values[0]) for index,values in explicit_marks.items() if values]
-    if len(observed)<2: return []
-    bases=sorted(item_num-index for index,item_num in observed)
-    base_num=bases[len(bases)//2]
-    rows=[]
-    for index,bucket in enumerate(cells_by_row):
-        cells={column:cell(bucket.get(column,[])) for column in range(1,11)}
-        drawing=normalize_ocr_numeric_code(cells[1].strip('.-'))
-        description=cells[2]; group=cells[3]; material=cells[4]
-        if not any((drawing,description,group,material,cells[5])): continue
-        explicit=explicit_marks.get(index+1,[])
-        expected_item=base_num+index
-        item_num=(explicit[0] if explicit and explicit[0]==expected_item else expected_item)
-        quantity_match=re.match(r'\s*(\d{1,4}(?:[.,]\d+)?)',cells[5])
-        quantity=table_measure(quantity_match.group(1)) if quantity_match else 0
-        issue=[]
-        if not explicit or explicit[0]!=item_num:
-            issue.append('Número do item recuperado pela sequência da tabela; conferir OCR.')
-        if quantity<=0:
-            quantity=1
-            issue.append('Quantidade não reconhecida; 1 unidade provisória, conferir PDF.')
-        normalized_group=norm(group)
-        if 'SUB PRODUTO' in normalized_group or 'SUBCONJUNTO' in normalized_group:
-            group='SUB PRODUTO'
-        elif 'POLIMER' in normalized_group:
-            group='POLIMEROS'
-        elif 'ACESSOR' in normalized_group:
-            group='ACESSORIOS'
-        elif 'EMBALAGEM' in normalized_group:
-            group='EMBALAGEM'
-        elif 'METAL' in normalized_group:
-            group='METAL'
-        elif not group and 'SUB PRODUTO' in norm(material):
-            group='SUB PRODUTO'
-        elif not group and 'POLIMER' in norm(material):
-            group='POLIMEROS'
-        spec=material_cell_spec(material)
-        material_norm=norm(material)
-        if 'TUBO' in material_norm and not (spec['width'] and spec['depth'] and spec['thickness']):
-            gauge=re.search(r'\bE\s*:?\s*(\d+(?:[,.]\d+)?)\s*MM',material,re.I)
-            lengths=re.findall(r'\bL\s*:?\s*(\d+(?:[,.]\d+)?)\s*MM?',material,re.I)
-            if gauge and len(lengths)>=2:
-                spec.update(thickness=num(gauge.group(1)),width=num(lengths[0]),depth=num(lengths[1]))
-        if ('CHAPA' in material_norm or 'PSAI' in material_norm) and not spec['thickness']:
-            gauge=re.search(r'\bE\s*:?\s*(\d+(?:[,.]\d+)?)\s*MM',material,re.I)
-            if gauge: spec['thickness']=num(gauge.group(1))
-        if 'ARAME' in material_norm and not spec['diameter']:
-            wire_material=material.upper().replace('O','0').replace('C','0')
-            gauge=re.search(r'(\d{1,2}[,.]\d{1,2})\s*MM\b',wire_material,re.I)
-            if gauge: spec['diameter']=num(gauge.group(1))
-        if not description:
-            description=fallback_technical_description(group,material,drawing,
-                thickness=spec['thickness'],diameter=spec['diameter'],
-                width=spec['width'],depth=spec['depth'],length=measure(cells[8]))
-        raw_code=''
-        code=re.search(r'[\[{]\s*((?:MP|AC|EM)[A-Z0-9]{5,})\s*[\]}]',material,re.I)
-        if code: raw_code=normalize_ocr_numeric_code(code.group(1))
-        treatment=cells[9]
-        printing_match=re.search(r'\b([014]x[014])\b',treatment,re.I)
-        unit_text=norm(cells[6])
-        unit='un' if unit_text in ('UN','UNID','UIV','U N','UNIDADE') else (cells[6] or 'un')
-        rows.append({'item_num':item_num,'quantity':quantity,
-            'description':description,'group':group,'material':material,
-            'thickness':spec['thickness'],'diameter':spec['diameter'],
-            'width':measure(cells[7]) or spec['width'],'depth':spec['depth'],
-            'length':measure(cells[8]),'drawing_id':drawing,
-            'unit_weight':0.0,'unit_area':0.0,'raw_code':raw_code,
-            'observation':cells[10],'printing_hint':printing_match.group(1).lower() if printing_match else '',
-            'printing':printing_match.group(1).lower() if printing_match else '0x0',
-            'unit':unit,'finish':treatment,'_ocr_issue':' '.join(issue)})
-    return rows
-
-
-def scanned_technical_bom(ocr_lines):
-    """Recover a preliminary BOM from coordinates on a scanned table page."""
-    lines=[x for x in ocr_lines if isinstance(x,dict) and x.get('text')]
-    def header(label):
-        return next((x for x in lines if norm(x['text']).startswith(label)),None)
-    item=header('ITEM QTD'); group=header('GRUPO'); material=header('MATERIAL')
-    drawing=header('DESENHO'); weight=header('PESO KG')
-    if not all((item,group,material,drawing,weight)): return []
-    y0=item['y']; x0=item['x']; gx=group['x']; mx=material['x']; dx=drawing['x']; wx=weight['x']
-    descriptions=[]
-    for line in lines:
-        x=line['x']; y=line['y']; value=line['text'].strip()
-        if y<=y0+12 or not (x0+65<x<gx-45): continue
-        if norm(value) in ('DESCRICAO','PROJETO','ENGENHEIRO','FOLHA'): continue
-        has_cell=any(abs(other['y']-y)<13 and
-                     (gx-30<other['x']<gx+120 or wx-20<other['x']<wx+80)
-                     for other in lines)
-        if has_cell: descriptions.append(line)
-    descriptions.sort(key=lambda x:x['y'])
-    rows=[]
-    for i,line in enumerate(descriptions):
-        y=line['y']; next_y=descriptions[i+1]['y'] if i+1<len(descriptions) else y+32
-        nearby=lambda left,right,low,high: [x for x in lines if left<x['x']<right and low<=x['y']<high]
-        quantity_candidates=nearby(x0+30,x0+75,y-5,y+7)
-        quantity=next((int(x['text']) for x in quantity_candidates
-                       if re.fullmatch(r'\d{1,3}',x['text']) and 0<int(x['text'])<100),None)
-        groups=nearby(gx-35,mx-50,y-7,y+10)
-        materials=nearby(mx-115,dx-80,y-10,next_y-5)
-        weights=nearby(wx-25,wx+90,y-8,y+11)
-        drawings=nearby(dx-85,wx-35,y-10,next_y-3)
-        raw_weight=next((num(x['text']) for x in weights if re.fullmatch(r'\d+(?:[,.]\d+)?',x['text'])),0.0)
-        group_text=' '.join(x['text'] for x in sorted(groups,key=lambda z:z['x']))
-        if not group_text and not raw_weight and not drawings: continue
-        rows.append({'description':line['text'].strip(),'quantity':quantity,
-                     'group':group_text,'material':' '.join(x['text'] for x in sorted(materials,key=lambda z:(z['y'],z['x']))),
-                     'drawing_id':' '.join(x['text'] for x in sorted(drawings,key=lambda z:(z['y'],z['x']))),
-                     'unit_weight':raw_weight})
-    return rows
-
-
-def rise_bom(text):
-    if 'LISTA DE MATERIAIS' not in norm(text): return []
-    lines=[x.strip() for x in text.splitlines() if x.strip()]
-    start=next((i for i,x in enumerate(lines) if norm(x)=='OBSERVACAO'),None)
-    if start is None: return []
-    out=[]; i=start+1
-    while i<len(lines)-5:
-        if not re.fullmatch(r'\d{1,3}',lines[i]):
-            i+=1; continue
-        item=int(lines[i]); qty_line=lines[i+1]
-        inline=re.fullmatch(r'(\d+(?:[.,]\d+)?)\s+(.+)',qty_line)
-        if re.fullmatch(r'\d+(?:[.,]\d+)?',qty_line):
-            qty=num(qty_line); desc_parts=[lines[i+2]]; j=i+3
-        elif inline:
-            qty=num(inline.group(1)); desc_parts=[inline.group(2)]; j=i+2
-        else:
-            i+=1; continue
-        while j<len(lines) and j<i+8 and norm(lines[j]) not in ('METAL','POLIMEROS','COMPRADOS','MADEIRA','EMBALAGEM','ACESSORIOS'):
-            desc_parts.append(lines[j]); j+=1
-        if j>=len(lines): break
-        group=lines[j]; desc=' '.join(desc_parts); j+=1
-        if qty<=0 or qty>10000 or norm(group) not in ('METAL','POLIMEROS','COMPRADOS','MADEIRA','EMBALAGEM','ACESSORIOS'):
-            i+=1; continue
-        material_lines=[]
-        while j<len(lines) and j<i+14 and not re.fullmatch(r'\d+(?:[.,]\d+)?',lines[j]) and not re.fullmatch(r'(?:PC|CJ|MP|EM|AC)\d+',lines[j],re.I):
-            material_lines.append(lines[j]); j+=1
-        code_index=next((k for k in range(j,min(j+8,len(lines))) if re.fullmatch(r'(?:PC|CJ|MP|EM|AC)\d+',lines[k],re.I)),None)
-        if code_index is None:
-            i+=1; continue
-        measures=[num(x) for x in lines[j:code_index] if re.fullmatch(r'\d+(?:[.,]\d+)?',x)]
-        width=depth=length=thickness=0.0
-        if len(measures)>=4:
-            thickness,width,depth,length=measures[:4]
-        elif len(measures)>=3:
-            thickness,width,length=measures[:3]
-        elif len(measures)>=1:
-            length=measures[-1]
-        next_is_item=(code_index+2<len(lines) and re.fullmatch(r'\d{1,3}',lines[code_index+1])
-            and (re.fullmatch(r'\d+(?:[.,]\d+)?',lines[code_index+2]) or
-                 re.match(r'^\d+(?:[.,]\d+)?\s+[A-Za-z]',lines[code_index+2])))
-        weight=0 if next_is_item else (num(lines[code_index+1]) if code_index+1<len(lines) else 0)
-        area=0 if next_is_item else (num(lines[code_index+2]) if code_index+2<len(lines) else 0)
-        if area>100: area=0
-        out.append({'item_num':item,'quantity':qty,'description':desc,'group':group,
-                    'material':' '.join(material_lines),'thickness':thickness,
-                    'width':width,'depth':depth,'length':length,'drawing_id':lines[code_index],
-                    'unit_weight':weight,'unit_area':area,
-                    'raw_code':(re.search(r'\{(MP\d+)\}', ' '.join(material_lines)) or [None,''])[1]})
-        i=code_index+1
-    return out
-
-
-def outpromo_bom(text):
-    lines=[x.strip() for x in text.splitlines() if x.strip()]
-    start=next((i for i in range(len(lines)-6) if norm(lines[i])=='ITEM'
-                and norm(lines[i+1]).startswith('DESCRIC') and norm(lines[i+2])=='QTD'
-                and norm(lines[i+3])=='MATERIAL'),None)
-    if start is None: return [],''
-    heading=''
-    for x in reversed(lines[max(0,start-14):start]):
-        if 'CONJUNTO' in norm(x): heading=x; break
-    end=next((i for i in range(start+7,len(lines)) if norm(lines[i])=='ASSINATURA'),len(lines))
-    result=[]; i=start+7
-    while i<end-2:
-        if not re.fullmatch(r'\d{1,2}',lines[i]) or not re.fullmatch(r'\d{1,3}',lines[i+2]):
-            i+=1; continue
-        number=int(lines[i]); desc=lines[i+1]; qty=int(lines[i+2]); i+=3
-        spec=[]
-        while i<end and not (re.fullmatch(r'\d{1,2}',lines[i]) and i+2<end and
-                              re.fullmatch(r'\d{1,3}',lines[i+2])):
-            spec.append(lines[i]); i+=1
-        if 0<qty<=1000:
-            result.append({'item_num':number,'description':desc,'quantity':qty,
-                           'material':spec[0] if spec else '',
-                           'dimension_cell':spec[1] if len(spec)>1 else '',
-                           'finish_cell':spec[2] if len(spec)>2 else '',
-                           'spec':' '.join(spec),'raw_code':''})
-    return result,heading
-
-
-def outpromo_detail_dimensions(text):
-    """Named flat PSAI pieces on a later OUTPROMO drawing page.
-
-    The two standalone dimensions immediately before each piece label are the
-    horizontal and vertical cut dimensions. Radius notes are deliberately
-    skipped; unrelated views without a named PSAI label are not matched.
-    """
-    lines=[x.strip() for x in text.splitlines() if x.strip()]
-    result={}
-    for i,label in enumerate(lines):
-        key=norm(label)
-        if not key.startswith('COMUNICACAO '): continue
-        following=' '.join(lines[i+1:i+5])
-        if 'PSAI' not in norm(following): continue
-        previous=[]
-        for candidate in reversed(lines[max(0,i-5):i]):
-            if 'PECAS' in norm(candidate): break
-            if re.fullmatch(r'\d+(?:[,.]\d+)?',candidate): previous.append(num(candidate))
-        previous.reverse()
-        if len(previous)!=2 or min(previous)<=0: continue
-        printing=re.search(r'\b4[Xx][04]\b',following)
-        result[key]={'length':previous[0],'width':previous[1],
-                     'printing':printing.group().lower() if printing else '',
-                     'label':label}
-    return result
-
-
-def outpromo_detail_key(description):
-    """Match BOM role to an explicitly named piece in the detail view."""
-    words=norm(description)
-    if not words.startswith('PSAI '): return ''
-    if 'TESTEIRA' in words: return 'COMUNICACAO TESTEIRA'
-    if 'QUADRO LATERAL' in words: return 'COMUNICACAO LATERAL'
-    if 'SAIA' in words and ('FRONTAL' in words or 'TRASEIRA' in words):
-        return 'COMUNICACAO SAIA MAIOR'
-    if 'SAIA LATERAL' in words: return 'COMUNICACAO SAIA MENOR'
-    return ''
-
-
-def can_base_drawn_dimensions(pages):
-    """Verified item-to-view links for the twelve-sheet CNBS_5582 drawing.
-
-    A view's overall outline is not automatically a tube cut length. Only
-    explicitly straight single-piece tubes and flat plates receive geometry
-    that can drive weight. Frames, U channels, bends and flat-iron supports
-    retain their visible envelope with a pending developed-length decision.
-    """
-    if len(pages)!=12 or not any('CNBS_5582' in body for body in pages):
-        return {}
-    # BOM item: detail page, drawing dimensions, role, expected description.
-    specs={
-        1:(4,1350,250,'envelope','QUADRO SAIA FRONTAL'),
-        2:(4,1350,250,'plate','CHAPA SAIA FRONTAL'),
-        3:(4,1350,250,'envelope','CANALETA SAIA FRONTAL'),
-        4:(5,1110,250,'envelope','QUADRO SAIA LATERAL'),
-        5:(5,1110,250,'plate','CHAPA SAIA LATERAL'),
-        6:(5,1110,250,'envelope','CANALETA SAIA LATERAL'),
-        7:(8,1530,140,'bend','TUBO BATE CARRINHO FRONTAL'),
-        8:(8,172,55,'bend','SUPORTE BATE CARRINHO'),
-        9:(9,1050,0,'straight_tube','TUBO BATE CARRINHO LATERAL'),
-        10:(10,800,0,'straight_tube','HASTE'),
-        11:(11,1000,315,'bend','HASTE'),
-        12:(7,650,225,'envelope','QUADRO DA TESTEIRA'),
-        13:(7,650,225,'plate','CHAPA TESTEIRA'),
-        14:(7,650,225,'envelope','CANALETA TESTEIRA'),
-        15:(6,1000,435,'envelope','QUADRO COMUNICA'),
-        16:(6,1000,435,'plate','CHAPA COMUNICA'),
-        17:(6,1000,435,'envelope','CANALETA COMUNICA'),
-        18:(6,47,22,'bend','TRAVA COMUNICA'),
-    }
-    def printed(body,value):
-        return bool(re.search(rf'(?m)^\s*{value}(?:[,.]0)?\s*$',body))
-    result={}
-    for item_num,(page,length,width,kind,prefix) in specs.items():
-        body=pages[page-1]
-        if not printed(body,length) or (width and not printed(body,width)):
-            continue
-        result[item_num]={'page':page,'length':length,'width':width,
-                          'kind':kind,'description_prefix':prefix}
-    return result
-
-
-def material_cell_spec(material, dimension_cell=''):
-    """Read material/profile data without mistaking commercial sheet size for cut size.
-
-    The seven-column OUTPROMO lists put the gauge before a hyphen and the
-    supplier's full sheet after it. Part dimensions belong to the detail view.
-    Other projects put gauge in the separate Dimensões column or in a tube
-    profile, so the two cells are interpreted together.
-    """
-    material=str(material or '').strip()
-    dimension_cell=str(dimension_cell or '').strip()
-    result=dict(thickness=0.0,diameter=0.0,width=0.0,depth=0.0,
-                stock_width=0.0,stock_length=0.0,observation='')
-    flat=re.search(rf'\bFERRO\s+(?:CHATO|LAMINADO)\s+{INCH_SIZE}\s*[xX×]\s*{INCH_SIZE}',material,re.I)
-    if flat:
-        result.update(width=inch_mm(flat.group(1)),thickness=inch_mm(flat.group(2)))
-        return result
-    round_inch=(re.search(rf'{INCH_SIZE}\s*[xX×]\s*(\d+(?:[,.]\d+)?)\s*mm',material,re.I)
-                if re.search(r'\bTUBO\b.*\bRED\b',material,re.I) else None)
-    if round_inch:
-        result.update(diameter=inch_mm(round_inch.group(1)),
-                      thickness=num(round_inch.group(2)))
-        return result
-    # HH GLOBAL RISE stock syntax: E:gauge X L:width X L:depth X C:stock.
-    # Extract the profile separately from the cut length in the BOM row.
-    tube=re.search(rf'\b(?:TUBO|METALON)\b.*?\bE\s*:\s*(\d+(?:[,.]\d+)?)\s*mm\s*'
-                   rf'[xX×]\s*L\s*:\s*(\d+(?:[,.]\d+)?)\s*mm\s*'
-                   rf'[xX×]\s*L\s*:\s*(\d+(?:[,.]\d+)?)\s*mm\s*'
-                   rf'[xX×]\s*C\s*:\s*(\d+(?:[,.]\d+)?)\s*mm',material,re.I)
-    if tube:
-        gauge,width,depth,stock_length=(num(value) for value in tube.groups())
-        result.update(thickness=gauge,width=width,depth=depth,stock_length=stock_length)
-        return result
-    sheet_stock=re.search(r'\bE\s*:\s*(\d+(?:[,.]\d+)?)\s*mm\s*'
-                          r'[xX×]\s*L\s*:\s*(\d+(?:[,.]\d+)?)\s*mm\s*'
-                          r'[xX×]\s*C\s*:\s*(\d+(?:[,.]\d+)?)\s*mm',material,re.I)
-    if sheet_stock:
-        gauge,stock_width,stock_length=(num(value) for value in sheet_stock.groups())
-        result.update(thickness=gauge,stock_width=stock_width,stock_length=stock_length)
-    flat_bar=re.search(rf'\bBARRA\s+CHATA\b.*?\bE\s*:\s*{INCH_SIZE}\s*'
-                       rf'[xX×]\s*L\s*:\s*{INCH_SIZE}',material,re.I)
-    if flat_bar:
-        result.update(thickness=inch_mm(flat_bar.group(1)),width=inch_mm(flat_bar.group(2)))
-        return result
-    profile_pattern=(r'(\d+(?:[,.]\d+)?)\s*[xX×]\s*'
-                     r'(\d+(?:[,.]\d+)?)\s*[xX×]\s*'
-                     r'(\d+(?:[,.]\d+)?)\s*(?:mm)?')
-    profiles=list(re.finditer(profile_pattern,material,re.I))
-    if re.search(r'\b(?:TUBO|METALON)\b',norm(material)) and profiles:
-        if len(profiles)==1:
-            a,b,gauge=(num(x) for x in profiles[0].groups())
-            result.update(width=a,depth=b,thickness=gauge)
-        else:
-            result['observation']='Mais de um perfil de tubo na lista; conferir a composição no desenho.'
-        return result
-    dia=re.search(r'[Øø�]\s*(\d+(?:[,.]\d+)?)\s*(?:mm)?',material+' '+dimension_cell,re.I)
-    if dia and 'ARAME' in norm(material):
-        result['diameter']=num(dia.group(1))
-    explicit=re.search(r'\bESP(?:ESSURA)?\.?\s*[:=]?\s*(\d+(?:[,.]\d+)?)\s*(?:mm)?',dimension_cell,re.I)
-    if explicit:
-        result['thickness']=num(explicit.group(1))
-    is_sheet=bool(re.search(r'\b(?:CHAPA|PSAI|PS|PVC|PETG|PET|ACRILICO|ACRÍLICO|POLIONDA)\b',norm(material)))
-    stock=re.search(r'[-–]\s*(\d{3,4}(?:[,.]\d+)?)\s*[xX×]\s*'
-                    r'(\d{3,4}(?:[,.]\d+)?)\s*(?:mm)?\b',material,re.I) if is_sheet else None
-    if stock:
-        result['stock_length']=num(stock.group(1))
-        result['stock_width']=num(stock.group(2))
-        result['observation']=f'Chapa comercial {stock.group(1)}×{stock.group(2)} mm.'
-    if is_sheet and not result['thickness']:
-        before=material[:stock.start()] if stock else material
-        gauge=re.search(r'(\d+(?:[,.]\d+)?)\s*(?:mm)?\s*$',before,re.I)
-        if gauge and 0<num(gauge.group(1))<=20:
-            result['thickness']=num(gauge.group(1))
-    return result
 
 
 def title_weight(text):
@@ -2161,10 +1027,11 @@ def select_bom_package_root(candidates, root_name=''):
 def process_complete_project(project_folder, approved_rules=None):
     root=Path(project_folder).resolve()
     if not root.is_dir(): raise ValueError('Pasta do projeto não encontrada')
-    pdfs=sorted(p for p in root.rglob('*') if p.is_file() and p.suffix.lower()=='.pdf'
-                and not any(x in norm(str(p.relative_to(root))) for x in ('OBSOLETO','ARTE','APRESENTACAO')))
+    pdfs=sorted(p for p in root.rglob('*') if p.is_file()
+                and is_technical_pdf(p.relative_to(root)))
     data=dict(name=root.name,code='',nominal_weight_pdf=0.0,nominal_area_pdf=0.0,
-              materials=[],wire_variants=[],tree={'name':root.name,'children':[]},pending_decisions=[])
+              materials=[],wire_variants=[],tree={'name':root.name,'children':[]},pending_decisions=[],
+              reading_report={'version':1,'documents':[],'events':[]})
     if not pdfs:
         data['pending_decisions'].append({'title':'Sem PDF técnico','description':'Importe desenho ou preencha a lista manualmente.','impact_level':'ALTO'})
         return data
@@ -2178,13 +1045,31 @@ def process_complete_project(project_folder, approved_rules=None):
             text='\n'.join(x[0] for x in pages)
             if any(x[1] for x in pages): scanned.append(str(path.relative_to(root)))
             boms=[]; seen_rows=set()
-            for n,(page_body,_) in enumerate(pages):
-                fresh=[]
-                for row in cad_bom(page_body):
-                    signature=(row['item_num'],norm(row['description']),row['quantity'],row['raw_code'])
-                    if signature not in seen_rows:
-                        fresh.append(row); seen_rows.add(signature)
-                if fresh: boms.append((n+1,fresh))
+            with pymupdf.open(path) as source_doc:
+                for n,(page_body,_) in enumerate(pages):
+                    fresh=[]
+                    for row in cad_bom(page_body,source_doc[n]):
+                        signature=(row['item_num'],norm(row['description']),row['quantity'],row['raw_code'])
+                        if signature not in seen_rows:
+                            fresh.append(row); seen_rows.add(signature)
+                    if fresh:
+                        boms.append((n+1,fresh))
+                        profile=('cad_part_number' if any(r.get('cad_layout')=='part_number_grid'
+                                                        for r in fresh) else
+                                 'cad_named_grid' if any(r.get('cad_layout') for r in fresh) else 'cad')
+                        record_reading(data,source_ref(root,path,n+1),profile,len(fresh),
+                                       reason=('Grade com número da peça, descrição e quantidade reconhecida.'
+                                               if profile=='cad_part_number' else
+                                               'Colunas identificadas da lista CAD, incluindo células vazias.'
+                                               if profile=='cad_named_grid' else
+                                               'Cabeçalho CAD e linhas com quantidade reconhecidos.'))
+            boms,unlinked_cad_pages=primary_cad_tables(boms)
+            if unlinked_cad_pages:
+                data['pending_decisions'].append({
+                    'title':'Vincular listas CAD de detalhe',
+                    'description':f"{path.name}: listas das páginas "+', '.join(map(str,unlinked_cad_pages))+
+                        ' não foram somadas à lista principal; confirmar conjunto dono e multiplicadores para evitar duplicidade.',
+                    'impact_level':'ALTO'})
             detail=details(text,cut_rows)
             if not detail.get('length') and not detail.get('width'):
                 with pymupdf.open(path) as doc:
@@ -2196,8 +1081,18 @@ def process_complete_project(project_folder, approved_rules=None):
                 if len(unique_dimensions)==1:
                     length,width=next(iter(unique_dimensions))
                     detail['length'],detail['width']=length,width
+            part_only=is_part_only_bom(boms,path.stem)
+            if part_only:
+                detail=cad_row_details(boms[0][1][0],detail)
+            if not detail.get('unit_weight') and any(row.get('cad_layout') for _,rows in boms for row in rows):
+                labelled_weights={num(w) for w in re.findall(
+                    r'PESO\s+TOTAL\s*\[\s*kg\s*\]\s*:\s*(\d+(?:[,.]\d+)?)',text,re.I)}
+                if len(labelled_weights)==1:detail['unit_weight']=next(iter(labelled_weights))
+            data['reading_report']['documents'].append({
+                'path':path.relative_to(root).as_posix(),'pages':len(pages),
+                'has_scanned_pages':any(page[1] for page in pages)})
             docs[path]={'text':text,'pages':[x[0] for x in pages],
-                        'boms':boms,'details':detail,
+                        'boms':boms,'details':detail,'part_only_bom':part_only,
                         'stem':norm(path.stem)}
             from wire_variants import parse_parameterized_wire_table
             for page_number, (page_body, _) in enumerate(pages, 1):
@@ -2206,6 +1101,7 @@ def process_complete_project(project_folder, approved_rules=None):
                         'source_page':source_ref(root,path,page_number),
                         'description':path.stem})
         except Exception as exc:
+            record_reading(data,source_ref(root,path),'unrecognized',stage='error',reason=str(exc))
             data['pending_decisions'].append({'title':'PDF não lido','description':f'{path.name}: {exc}','impact_level':'ALTO'})
     for path in scanned:
         data['pending_decisions'].append({'title':'Conferir OCR','description':f'{path}: página digitalizada ou sem texto. OCR local usado quando disponível.','impact_level':'ALTO'})
@@ -2219,6 +1115,10 @@ def process_complete_project(project_folder, approved_rules=None):
                 continue
             bom,cuts=read_score_package(pdf)
             if len(bom)>=10:
+                for bom_page in sorted({row['page'] for row in bom}):
+                    record_reading(data,source_ref(root,path,bom_page),'score',
+                                   sum(row['page']==bom_page for row in bom),stage='selected',
+                                   reason='Lista SCORE nesta folha; continuação e cortes lidos no mesmo pacote.')
                 return score_package_materials(data,root,path,pdf,bom,cuts)
     # Some older project packages contain only rasterized sheets. Read the
     # product list on sheet two with the built-in Windows OCR engine, keeping
@@ -2262,12 +1162,16 @@ def process_complete_project(project_folder, approved_rules=None):
                         # treat arbitrary visible numbers (e.g. wheel capacity
                         # 80 kg) as the product weight/title block.
                         body=''
+                        record_reading(data,source_ref(root,scanned_path,page_index+1),
+                                       'scanned_rise',len(rows),reason='Colunas recuperadas por OCR; conferir a imagem.')
                         scanned_rise_tables.append((scanned_path,page_index+1,
                                                     rows,body,None))
             except Exception as exc:
                 data['pending_decisions'].append({'title':'OCR não concluído',
                     'description':f'{scanned_path.name}: {exc}','impact_level':'ALTO'})
         if len(ocr_rows)>=5 and not scanned_rise_tables:
+            record_reading(data,source_ref(root,path,2),'scanned_technical',len(ocr_rows),
+                           stage='selected',reason='Lista OCR da página 2; nenhuma grade RISE posterior reconhecida.')
             for row in ocr_rows:
                 qty=row['quantity'] if row['quantity'] is not None else 1
                 weight=row['unit_weight']; group=resolve_material_group(row['description'],row['material'])
@@ -2328,7 +1232,11 @@ def process_complete_project(project_folder, approved_rules=None):
                     measurements=technical_title_dimensions(sheet)
                     if measurements:
                         technical_details[(path,next(iter(part_codes)))]=(page,measurements)
-                sections=ordered_rise_grid_bom(sheet,separate=True)
+                reading=read_technical_table(body,sheet)
+                sections=reading.sections
+                if reading.rows:
+                    record_reading(data,source_ref(root,path,page),reading.profile,len(reading.rows),
+                                   reason=reading.reason)
                 if sections:
                     words=sheet.get_text('words')
                     for index,(rows,_,bottom) in enumerate(sections):
@@ -2353,7 +1261,7 @@ def process_complete_project(project_folder, approved_rules=None):
                             code_hint=None
                         technical.append((path,page,rows,body,code_hint))
                 else:
-                    rows=technical_table_bom(body,sheet)
+                    rows=reading.rows
                     if rows: technical.append((path,page,rows,body,None))
     if technical:
         # The product BOM is generally the largest table; smaller tables on
@@ -2389,6 +1297,11 @@ def process_complete_project(project_folder, approved_rules=None):
         # Join only a gapless continuation for the selected root; detail BOMs
         # that restart at item 1 remain separate assemblies.
         main_path, main_page, main_rows, main_body, main_code = main
+        main_source=source_ref(root,main_path,main_page)
+        main_profile=next((event['profile'] for event in reversed(data['reading_report']['events'])
+                           if event['source_page']==main_source),'technical_text')
+        record_reading(data,main_source,main_profile,len(main_rows),stage='selected',
+                       reason='Raiz técnica selecionada por pasta de produção, referências pai/filho e ordem das folhas.')
         next_item = max((row['item_num'] for row in main_rows), default=0) + 1
         continuation_ids = set()
         for path, page, rows, body, code_hint in sorted(technical, key=lambda entry: entry[1]):
@@ -2701,9 +1614,14 @@ def process_complete_project(project_folder, approved_rules=None):
             with pymupdf.open(path) as doc:
                 for n,page in enumerate(doc):
                     rows=rise_bom(page.get_text())
-                    if rows: rise.append((path,n+1,rows))
+                    if rows:
+                        rise.append((path,n+1,rows))
+                        record_reading(data,source_ref(root,path,n+1),'rise_text',len(rows),
+                                       reason='Lista RISE textual com códigos de peças e grupos reconhecidos.')
     if rise:
         path,page,rows=max(rise,key=lambda x:len(x[2]))
+        record_reading(data,source_ref(root,path,page),'rise_text',len(rows),stage='selected',
+                       reason='Maior lista RISE textual entre as páginas reconhecidas.')
         head=docs[path]['text']
         wt=re.search(r'Peso Total:\s*\n(?:[^\n]*\n){0,8}?([\d,.]+)\s*kg',head,re.I)
         values=re.findall(r'([\d,.]+)\s*kg',head,re.I)
@@ -2725,14 +1643,26 @@ def process_complete_project(project_folder, approved_rules=None):
             data['materials'].append(entry)
     else:
         # Choose the top assembly. A folder with several unrelated root PDFs is ambiguous.
-        candidates=[(p,v) for p,v in docs.items() if v['boms']]
+        all_candidates=[(p,v) for p,v in docs.items() if v['boms']]
+        candidates=[(p,v) for p,v in all_candidates if not v.get('part_only_bom')] or all_candidates
         if candidates:
             root_name=norm(root.name)
             selected_root=select_bom_package_root(candidates,root_name)
-            candidates.sort(key=lambda pv:(0 if pv[1]['stem'].startswith(root_name) else 1,
+            candidates.sort(key=lambda pv:(
+                                       0 if selected_root or any(not row.get('cad_layout')
+                                           for _,rows in pv[1]['boms'] for row in rows) else 1,
+                                       0 if pv[1]['stem'].startswith(root_name) else 1,
                                        len(pv[0].relative_to(root).parts),
                                        -sum(len(b) for _,b in pv[1]['boms'])))
             main=selected_root or candidates[0][0]
+            main_profile=('cad_part_number' if any(row.get('cad_layout')=='part_number_grid'
+                          for _,rows in docs[main]['boms'] for row in rows) else
+                          'cad_named_grid' if any(row.get('cad_layout')
+                          for _,rows in docs[main]['boms'] for row in rows) else 'cad')
+            record_reading(data,source_ref(root,main,docs[main]['boms'][0][0]),main_profile,
+                           sum(len(rows) for _,rows in docs[main]['boms']),stage='selected',
+                           reason=('Raiz identificada pelas referências entre conjuntos ou nome da pasta.'
+                                   if selected_root else 'Seleção por nome, profundidade de pasta e tamanho da lista; conferir variantes.'))
             top_level=[p for p,v in candidates if len(p.relative_to(root).parts)==len(main.relative_to(root).parts)]
             if selected_root is None and len(top_level)>1:
                 data['pending_decisions'].append({'title':'Escolher variante do produto',
@@ -2743,12 +1673,19 @@ def process_complete_project(project_folder, approved_rules=None):
             for p,v in docs.items(): byname[v['stem']].append(p)
             visiting=set()
             aliases_used=set()
-            def match_child(desc):
+            def match_child(desc, part_number=''):
                 key=norm(desc)
                 exact=byname.get(key,[])
                 if len(exact)==1: return exact[0]
                 matches=[p for p,v in docs.items() if v['stem']==key or v['stem'].startswith(key+' ')]
                 if len(matches)==1: return matches[0]
+                if part_number:
+                    printed=norm(part_number)
+                    numbered=[p for p,v in docs.items() if v['stem']==printed
+                              or v['stem'].startswith(printed+' ')
+                              or (re.fullmatch(r'[A-Z0-9]+',printed)
+                                  and v['stem'].endswith(' '+printed))]
+                    if len(numbered)==1:return numbered[0]
                 shared=shared_side_drawing(desc,docs)
                 if shared: return shared
                 variant=re.search(r'\s\d+(?:[,.]\d+)?$',key)
@@ -2776,22 +1713,28 @@ def process_complete_project(project_folder, approved_rules=None):
                 info=docs[path]
                 rows=[(page,row) for page,bom in info['boms'] for row in bom]
                 for page,row in rows:
-                    qty=mult*row['quantity']; desc=row['description']; child=match_child(desc)
-                    if child and child!=path and docs[child]['boms']:
+                    qty=mult*row['quantity']; desc=row['description']; child=match_child(desc,row.get('part_number',''))
+                    if child and child!=path and docs[child]['boms'] and not docs[child].get('part_only_bom'):
                         walk(child,qty,parent+' / '+desc)
                         continue
                     detail=(parameterized_details(docs[child]['text'],desc) or docs[child]['details']) if child else {}
+                    detail=cad_row_details(row,detail)
                     source=source_ref(root,child or path,1 if child else page)
                     if child and detail.get('cut_table_rows'):
                         data['materials'].extend(cut_table_materials(
                             desc,qty,source,parent,child.stem,detail,row['raw_code']))
                         continue
-                    mat=detail.get('material',''); group=resolve_material_group(desc,mat)
+                    mat=detail.get('material','') or row.get('material',''); group=resolve_material_group(desc,mat)
                     weight=detail.get('unit_weight',0.0); area=detail.get('unit_area',0.0)
                     issue=('Desenho da peça não localizado; conferir dimensões e peso.' if not child
                            else ('Comprimento desenvolvido do tubo não identificado; conferir desenho.'
                                  if group in ('Tubo Quadrado/Retangular','Tubo Redondo')
                                  and not detail.get('length') else ''))
+                    if row.get('assembly_hint'):
+                        group='Subconjunto'
+                        issue='Subconjunto sem lista detalhada; confirmar a composição no desenho.'
+                    if row.get('row_weight_raw') and not row.get('weight_unit_explicit'):
+                        issue=' '.join(x for x in (issue,'Peso da lista sem unidade explícita; conferir kg ou g.') if x)
                     item=empty_item(desc,qty,source,group,parent,
                         material=mat,thickness=detail.get('thickness',0.0),radius_diam=detail.get('diameter',0.0),
                         width=detail.get('width',0.0),depth=detail.get('depth',0.0),length=detail.get('length',0.0),
@@ -2802,7 +1745,11 @@ def process_complete_project(project_folder, approved_rules=None):
                         observation=('Quadro de corte: '+ '; '.join(
                             f"item {r['item_num']}: {r['quantity']} x {r['length']:g} mm ({r['material']})"
                             for r in detail.get('cut_table_rows',[]))
-                            if detail.get('cut_table_rows') else ''))
+                            if detail.get('cut_table_rows') else
+                            f"Lista CAD: item {row['item_num']}"+
+                            (f"; peso impresso {row['row_weight_raw']} (unidade a conferir)."
+                             if row.get('row_weight_raw') and not row.get('weight_unit_explicit') else '.')
+                            if row.get('cad_layout') else ''))
                     data['materials'].append(item)
                 visiting.remove(path)
             walk(main,1,main.stem)
@@ -2817,12 +1764,17 @@ def process_complete_project(project_folder, approved_rules=None):
                 for n,page in enumerate(doc):
                     body=page.get_text()
                     rows,heading=outpromo_bom(body)
-                    if rows: outpromo.append((path,n+1,rows,heading))
+                    if rows:
+                        outpromo.append((path,n+1,rows,heading))
+                        record_reading(data,source_ref(root,path,n+1),'outpromo',len(rows),
+                                       reason='Cabeçalho Item/Descrição/Qtd/Material da lista de sete colunas.')
                     for key,detail in outpromo_detail_dimensions(body).items():
                         outpromo_details.append((path,n+1,key,detail))
         if outpromo:
             root_pages=[entry for entry in outpromo if entry[3]=='']
             main=max(root_pages or outpromo,key=lambda x:len(x[2]))
+            record_reading(data,source_ref(root,main[0],main[1]),'outpromo',len(main[2]),stage='selected',
+                           reason='Lista principal sem cabeçalho de subconjunto, ou maior lista disponível.')
             detail_lookup={key:(page,detail) for path,page,key,detail in outpromo_details
                            if path==main[0]}
             drawn_views=can_base_drawn_dimensions(docs[main[0]]['pages'])
@@ -2895,12 +1847,18 @@ def process_complete_project(project_folder, approved_rules=None):
                     data['materials'].append(item)
             walk_outpromo(main[0],main[1],main[2],1,main[0].stem,set())
     if not data['materials']:
+        if not any(info['details'].get('cut_table_rows') for info in docs.values()):
+            for path in docs:
+                record_reading(data,source_ref(root,path),'unrecognized',stage='unresolved',
+                               reason='Nenhuma lista de componentes reconhecida; composição pendente.')
         if len(docs)==1:
             path,info=next(iter(docs.items()))
             data['nominal_weight_pdf']=info['details'].get('unit_weight',0.0)
             data['nominal_area_pdf']=info['details'].get('unit_area',0.0)
             detail=info['details']; rows=detail.get('cut_table_rows',[])
             if rows:
+                record_reading(data,source_ref(root,path),'cut_table',len(rows),stage='selected',
+                               reason='PDF avulso com quadro de corte reconhecido.')
                 data['materials'].extend(cut_table_materials(
                     path.stem,1,source_ref(root,path,1),path.stem,path.stem,detail))
             else:

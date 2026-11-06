@@ -16,6 +16,7 @@ from calc_engine import (
 from markup_engine import calculate_markup
 from comparator import analyze_weights
 from reader_v3 import process_complete_project
+from reading_reports import get_reading_report, save_reading_report
 from wire_variants import insert_wire_variants
 from pricing import (approved_rules, reprice_project, price_item, metal_price_basis,
                      psai_price_basis, porta_linear_length_mm)
@@ -238,11 +239,13 @@ def get_project_full_data(project_id: int):
     project['missing_weights_count'] = len(missing_weights)
     project['open_decisions_count'] = len(unresolved)
     project['unresolved_assemblies_count'] = len(unresolved_assemblies)
+    reading_report = get_reading_report(conn, project_id)
 
     conn.close()
 
     return {
         "project": project,
+        "reading_report": reading_report,
         "materials": materials,
         "wire_variants": wire_variants,
         "ai_discovered_items": ai_discovered_items,
@@ -457,6 +460,7 @@ def import_project_folder(project_id: int, folder_path: str = Form(...),
                 f"porque encontrou {issue['match_count']} correspondência(s) na nova leitura. "
                 'O histórico original foi mantido; conferir a nova BOM antes de reaplicar.',
                 'ALTO', 'Vincular a edição ao item correto e revisar medidas/peso.'))
+    save_reading_report(conn, project_id, pdata.get('reading_report', {}))
     insert_wire_variants(conn, project_id, pdata.get('wire_variants', []))
     reprice_project(conn,project_id)
 
